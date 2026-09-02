@@ -15,6 +15,7 @@ so any number of these can run concurrently.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from typing import Callable, Optional
@@ -138,7 +139,9 @@ async def generate_dockerfile(
 
     for attempt in range(1, settings.max_heal_retries + 1):
         # Ask the builder how the CURRENT dockerfile fared.
-        last_error = build_fn(current.dockerfile_content)
+        # Run in a worker thread so a slow docker build never blocks the event
+        # loop (WebSocket progress events can still flush mid-build).
+        last_error = await asyncio.to_thread(build_fn, current.dockerfile_content)
 
         if not last_error or not last_error.strip():
             _log(f"Build succeeded on attempt (initial+{attempt - 1})", job_id)

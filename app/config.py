@@ -29,5 +29,34 @@ class Settings:
     # 3 retries (plus the initial generation) is plenty for a hackathon.
     max_heal_retries: int = int(os.getenv("MAX_HEAL_RETRIES", "3"))
 
+    # ---- DevOps / Infra -------------------------------------------------
+    # Skip the real docker build (useful on machines without Docker Desktop).
+    skip_docker_build: bool = os.getenv("SKIP_DOCKER_BUILD", "").lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+
+    # Bound a single build+health attempt (seconds).
+    docker_build_timeout_s: float = float(os.getenv("DOCKER_BUILD_TIMEOUT_S", "180"))
+    docker_health_timeout_s: float = float(os.getenv("DOCKER_HEALTH_TIMEOUT_S", "45"))
+
+    # Default container listen port when the generated Dockerfile doesn't say.
+    default_app_port: int = int(os.getenv("DEFAULT_APP_PORT", "8000"))
+
+    # Render (primary free host).
+    render_api_key: str = os.getenv("RENDER_API_KEY", "")
+    render_owner_id: str = os.getenv("RENDER_OWNER_ID", "")
+    render_region: str = os.getenv("RENDER_REGION", "oregon")
+    render_plan: str = os.getenv("RENDER_PLAN", "free")
+
+    # Docker Hub — used to push the local image so Render can pull it.
+    dockerhub_username: str = os.getenv("DOCKERHUB_USERNAME", "")
+    dockerhub_token: str = os.getenv("DOCKERHUB_TOKEN", "")
+
+    # Supabase persistence (optional — in-memory store still works without it).
+    supabase_url: str = os.getenv("SUPABASE_URL", "")
+    supabase_service_key: str = os.getenv("SUPABASE_SERVICE_KEY", "")
+
 
 settings = Settings()

@@ -132,3 +132,19 @@ class JobStatus(BaseModel):
     logs: list[JobEvent] = Field(default_factory=list)
     result: Optional[DockerfileResult] = None
     error: Optional[str] = None
+    # Populated by the DevOps deploy step when a live host URL is available.
+    deploy_url: Optional[str] = None
+
+
+class DeploymentRecord(BaseModel):
+    """One deploy attempt — backs the history / rollback view."""
+
+    id: str
+    job_id: Optional[str] = None
+    provider: str = "render"
+    service_id: Optional[str] = None
+    live_url: Optional[str] = None
+    image_tag: Optional[str] = None
+    status: str
+    is_active: bool = False
+    created_at: Optional[datetime] = None
