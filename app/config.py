@@ -17,9 +17,8 @@ class Settings:
     # Groq API key. Ideally set as GROQ_API_KEY in the environment.
     groq_api_key: str = os.getenv("GROQ_API_KEY", "")
 
-    # Fast Groq-hosted model. llama-3.3-70b-versatile is a good speed/quality
-    # balance for one-shot structured outputs.
-    groq_model: str = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+    # Fast Groq-hosted model. Default updated for current Groq catalog.
+    groq_model: str = os.getenv("GROQ_MODEL", "openai/gpt-oss-20b")
 
     # Temperature kept low so the model sticks to the template rather than
     # inventing Dockerfile syntax.
