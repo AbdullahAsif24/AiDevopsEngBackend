@@ -7,6 +7,7 @@ This module is the contract surface the whole pipeline depends on:
   * JobEvent/JobStatus -> the WebSocket event shape we emit
 
 Teammates (DevOps + Frontend) should treat these field names as stable.
+
 """
 from __future__ import annotations
 
