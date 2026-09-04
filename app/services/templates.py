@@ -1,51 +1,28 @@
-"""Dockerfile templates (Node, Python, static/nginx) with clear placeholders.
-
-The "template + LLM-fill" approach: instead of letting the model write Docker
-syntax freeform (the source of broken builds), we give a well-formed skeleton
-with `$PLACEHOLDER`s and ask it to only fill the blanks. This makes retries
-tractable: a bad patch is a wrong *value*, not malformed *syntax*.
-
-Note on `CMD`: we use SHELL form (`CMD node server.js`) rather than exec form
-(`CMD ["node", "server.js"]`) for the runtime command. Shell form keeps a single
-placeholder substitution valid without the model having to split a string into
-an argv array — far less error-prone for LLM patch loops.
-"""
+"""Dockerfile templates (Node, Python, Vite/static nginx) with clear placeholders."""
 from __future__ import annotations
 
 from string import Template
 
 
-# ---------------------------------------------------------------------------
-# Node.js / Express
-# ---------------------------------------------------------------------------
 NODE_TEMPLATE = Template(
     """\
 # ---------- Node.js application ($FRAMEWORK_NOTE) ----------
 FROM node:20-alpine
 
-# Set the working directory inside the container.
 WORKDIR /app
 
-# Install dependencies FIRST (layer-cache friendly: code changes don't
-# re-trigger npm install as long as package*.json are unchanged).
 COPY package*.json ./
 RUN npm install --production
 
-# Copy the rest of the application source.
 COPY . .
 
-# The port the app listens on (filled from the fingerprint).
 EXPOSE $PORT
 
-# Shell-form launch command, e.g.  node server.js
 CMD $START_COMMAND
 """
 )
 
 
-# ---------------------------------------------------------------------------
-# Python (Flask / FastAPI)
-# ---------------------------------------------------------------------------
 PYTHON_TEMPLATE = Template(
     """\
 # ---------- Python application ($FRAMEWORK_NOTE) ----------
@@ -53,58 +30,111 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
-# Install Python dependencies. Copy-then-install keeps layers cacheable.
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
-# For pyproject.toml projects the DEPS layer would instead be:
-#   COPY pyproject.toml ./
-#   RUN pip install --no-cache-dir .
-
-# Copy the rest of the source.
 COPY . .
 
 EXPOSE $PORT
 
-# Launch the app, e.g.  uvicorn main:app --host 0.0.0.0 --port 8000
-# or  flask --app app run --host 0.0.0.0 --port 5000
 CMD $START_COMMAND
 """
 )
 
 
-# ---------------------------------------------------------------------------
-# Static site / nginx
-# ---------------------------------------------------------------------------
-STATIC_TEMPLATE = Template(
-    """\
-# ---------- Static site served by nginx ($FRAMEWORK_NOTE) ----------
+# Shown to the LLM with $PLACEHOLDER names; dollars for Docker ARG/ENV are
+# written as ${...} style in guidance — the filled output must be valid Docker.
+STATIC_TEMPLATE_SKELETON = """\
+# ---------- SPA / static frontend ($FRAMEWORK_NOTE) ----------
+# Stage 1: npm build (Vite / React / similar)
+FROM node:20-alpine AS build
+WORKDIR /app
+COPY package*.json ./
+RUN npm install
+COPY . .
+ARG VITE_API_BASE_URL=
+ARG VITE_SUPABASE_URL=
+ARG VITE_SUPABASE_ANON_KEY=
+ARG VITE_USE_MOCK=false
+ENV VITE_API_BASE_URL=$VITE_API_BASE_URL
+ENV VITE_SUPABASE_URL=$VITE_SUPABASE_URL
+ENV VITE_SUPABASE_ANON_KEY=$VITE_SUPABASE_ANON_KEY
+ENV VITE_USE_MOCK=$VITE_USE_MOCK
+RUN npm run build
+
+# Stage 2: nginx serves $STATIC_SOURCE (usually dist) on port 80
 FROM nginx:alpine
-
-# Copy the pre-built static files into nginx's web root.
-# $STATIC_SOURCE is usually 'dist' (filled from the fingerprint) or '.' if the
-# HTML is at the repo root.
-COPY $STATIC_SOURCE /usr/share/nginx/html
-
-# nginx listens on port 80 by default.
+COPY nginx.spa.conf /etc/nginx/conf.d/default.conf
+COPY --from=build /app/$STATIC_SOURCE /usr/share/nginx/html
 EXPOSE 80
+CMD ["nginx", "-g", "daemon off;"]
 """
-)
 
 
-# Framework key (matching contracts.Framework.value) -> template.
 TEMPLATES: dict[str, Template] = {
     "node": NODE_TEMPLATE,
     "python": PYTHON_TEMPLATE,
-    "static": STATIC_TEMPLATE,
 }
 
 
 def describe_templates() -> str:
-    """Render each template skeleton (placeholders intact) for the prompt.
+    """Render each template skeleton for the prompt."""
+    parts = [
+        f"--- {name} template ---\n{tmpl.template}" for name, tmpl in TEMPLATES.items()
+    ]
+    parts.append(f"--- static template ---\n{STATIC_TEMPLATE_SKELETON}")
+    return "\n\n".join(parts)
 
-    The model sees these skeletons and is told to pick+fill one. Keeping the
-    placeholders visible (rather than pre-filled) guarantees it knows every
-    knob it's allowed to touch.
-    """
-    return "\n\n".join(f"--- {name} template ---\n{tmpl.template}" for name, tmpl in TEMPLATES.items())
+
+_NGINX_SPA_CONF = """\
+server {
+  listen 80;
+  server_name _;
+  root /usr/share/nginx/html;
+  index index.html;
+
+  location / {
+    try_files $uri $uri/ /index.html;
+  }
+}
+"""
+
+
+def render_static_dockerfile(
+    *,
+    framework_note: str = "Vite/React SPA",
+    static_source: str = "dist",
+) -> str:
+    """Deterministic multi-stage Dockerfile for SPA frontends."""
+    return f"""\
+# ---------- SPA / static frontend ({framework_note}) ----------
+FROM node:20-alpine AS build
+WORKDIR /app
+COPY package*.json ./
+RUN npm install
+COPY . .
+ARG VITE_API_BASE_URL=
+ARG VITE_SUPABASE_URL=
+ARG VITE_SUPABASE_ANON_KEY=
+ARG VITE_USE_MOCK=false
+ENV VITE_API_BASE_URL=$VITE_API_BASE_URL
+ENV VITE_SUPABASE_URL=$VITE_SUPABASE_URL
+ENV VITE_SUPABASE_ANON_KEY=$VITE_SUPABASE_ANON_KEY
+ENV VITE_USE_MOCK=$VITE_USE_MOCK
+RUN npm run build
+
+FROM nginx:alpine
+COPY nginx.spa.conf /etc/nginx/conf.d/default.conf
+COPY --from=build /app/{static_source} /usr/share/nginx/html
+EXPOSE 80
+CMD ["nginx", "-g", "daemon off;"]
+"""
+
+
+def ensure_nginx_spa_conf(repo_path: str) -> None:
+    """Write nginx.spa.conf into the build context (required by static Dockerfile)."""
+    import os
+
+    path = os.path.join(repo_path, "nginx.spa.conf")
+    with open(path, "w", encoding="utf-8", newline="\n") as fh:
+        fh.write(_NGINX_SPA_CONF)

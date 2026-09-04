@@ -43,6 +43,13 @@ class Settings:
     # Default container listen port when the generated Dockerfile doesn't say.
     default_app_port: int = int(os.getenv("DEFAULT_APP_PORT", "8000"))
 
+    # Baked into Vite/React frontend images at `docker build` time (build-args).
+    # Set VITE_API_BASE_URL to your *public* backend URL before deploying a SPA.
+    vite_api_base_url: str = os.getenv("VITE_API_BASE_URL", "")
+    vite_supabase_url: str = os.getenv("VITE_SUPABASE_URL", "") or os.getenv("SUPABASE_URL", "")
+    vite_supabase_anon_key: str = os.getenv("VITE_SUPABASE_ANON_KEY", "")
+    vite_use_mock: str = os.getenv("VITE_USE_MOCK", "false")
+
     # Render (primary free host).
     render_api_key: str = os.getenv("RENDER_API_KEY", "")
     render_owner_id: str = os.getenv("RENDER_OWNER_ID", "")

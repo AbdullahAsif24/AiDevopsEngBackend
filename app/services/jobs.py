@@ -171,20 +171,42 @@ async def _generate_with_healing(
         def build_fn(dockerfile_content: str) -> Optional[str]:
             return None
     else:
+        vite_args = {
+            "VITE_API_BASE_URL": settings.vite_api_base_url,
+            "VITE_SUPABASE_URL": settings.vite_supabase_url,
+            "VITE_SUPABASE_ANON_KEY": settings.vite_supabase_anon_key,
+            "VITE_USE_MOCK": settings.vite_use_mock,
+        }
+
         def build_fn(dockerfile_content: str) -> Optional[str]:
             asyncio.run_coroutine_threadsafe(
                 _log(job, JobStage.BUILDING, "Starting Docker build + health check"),
                 loop,
             )
             exposed = _guess_port(dockerfile_content) or port
+            timeout = settings.docker_build_timeout_s
+            is_spa = "AS build" in dockerfile_content or "nginx.spa.conf" in dockerfile_content
+            if is_spa:
+                timeout = max(timeout, 420.0)
+                if not settings.vite_api_base_url:
+                    asyncio.run_coroutine_threadsafe(
+                        _log(
+                            job,
+                            JobStage.BUILDING,
+                            "Warning: VITE_API_BASE_URL empty — set public API URL in backend .env "
+                            "or the live frontend cannot reach the backend",
+                        ),
+                        loop,
+                    )
             err = build_and_test(
                 repo_root,
                 dockerfile_content,
                 port=exposed,
                 image_tag=image_tag,
-                build_timeout_s=settings.docker_build_timeout_s,
+                build_timeout_s=timeout,
                 health_timeout_s=settings.docker_health_timeout_s,
                 keep_image=True,
+                buildargs=vite_args,
                 on_progress=on_progress,
             )
             if err:
@@ -288,3 +310,9 @@ async def get_job(job_id: str) -> JobStatus:
     if job is None:
         raise JobNotFound(job_id)
     return job
+
+
+async def list_jobs() -> list[JobStatus]:
+    """Return all in-memory jobs (newest not sorted — caller may sort)."""
+    async with _jobs_lock:
+        return list(_JOBS.values())

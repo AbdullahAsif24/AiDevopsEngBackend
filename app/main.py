@@ -10,6 +10,7 @@ from __future__ import annotations
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from .routes import api_jobs as api_jobs_router
 from .routes import deployments as deployments_router
 from .routes import jobs as jobs_router
 from .routes import ws as ws_router
@@ -34,6 +35,7 @@ app.add_middleware(
 )
 
 app.include_router(jobs_router.router)
+app.include_router(api_jobs_router.router)
 app.include_router(deployments_router.router)
 app.include_router(ws_router.router)
 

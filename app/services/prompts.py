@@ -32,13 +32,19 @@ def _fingerprint_payload(fingerprint: RepoFingerprint) -> str:
     return fingerprint.model_dump_json()
 
 
-def build_generation_prompt(fingerprint: RepoFingerprint, template_skeletons: str) -> str:
-    """Prompt for the FIRST pass: analyze the repo and produce a Dockerfile.
+def build_generation_prompt(
+    fingerprint: RepoFingerprint,
+    template_skeletons: str,
+    recommended_framework: str | None = None,
+) -> str:
+    """Prompt for the FIRST pass: analyze the repo and produce a Dockerfile."""
+    hint = ""
+    if recommended_framework:
+        hint = (
+            f"\n- Detector hint: prefer framework '{recommended_framework}' unless "
+            "the fingerprint clearly contradicts it.\n"
+        )
 
-    `template_skeletons` is describe_templates() output — the three skeletons the
-    model is allowed to fill. We forbid freeform Docker syntax, which bounds the
-    output space and makes retries meaningful.
-    """
     return f"""\
 You are an expert DevOps engineer. Given a compact fingerprint of a GitHub repo,
 produce a working Dockerfile by FILLING IN ONE of the provided template skeletons.
@@ -57,23 +63,22 @@ Do NOT write Dockerfile syntax from scratch — only fill placeholders.
 {template_skeletons}
 
 ## GUIDANCE
-- Detect the stack: Node/Express if package.json lists 'express' OR the file
-  tree/entry point is a .js server. Python if requirements.txt / pyproject.toml
-  exists and entry point is a .py app. Otherwise static (HTML/CSS/JS or dist/).
-- Java / compiled languages are OUT OF SCOPE. If the repo doesn't clearly map to
-  one of the three templates, choose the closest and note it in metadata.
-- Pick the correct template, then substitute:
-  * $FRAMEWORK_NOTE  -> short human description, e.g. "Express for Node", or
-                        "FastAPI (Python)".
-  * $PORT            -> the actual port from the fingerpint's entry point or
-                        manifest scripts (default 3000 for node, 8000 for python).
-  * $START_COMMAND   -> how to launch, e.g. "node server.js", or
-                        "uvicorn main:app --host 0.0.0.0 --port $PORT".
-  * $STATIC_SOURCE   -> for static: the directory to copy, usually 'dist' or '.'.
-- In the returned JSON: `dockerfile_content` must be the COMPLETE Dockerfile
-  (all lines, fully filled). `framework` = 'node' | 'python' | 'static'.
-- If an existing Dockerfile/docker-compose was provided in the fingerprint, prefer
-  adapting it (fixing obvious errors) rather than regenerating.
+- Detect the stack carefully:
+  * framework=node ONLY if package.json has a real HTTP server (express/fastify/koa)
+    or a start script that runs a long-lived server (node server.js).
+  * framework=static if vite.config.*, Vite/React SPA, CRA, or plain HTML —
+    MUST use the static multi-stage template (npm run build → nginx :80).
+    NEVER use `npm start` / `vite` dev server for production Docker.
+  * framework=python if requirements.txt / pyproject.toml + .py entry.
+{hint}- Pick the correct template, then substitute:
+  * $FRAMEWORK_NOTE  -> short human description.
+  * $PORT            -> listen port (3000 node, 8000 python, 80 static/nginx).
+  * $START_COMMAND   -> launch command for node/python only.
+  * $STATIC_SOURCE   -> build output dir: usually 'dist' (Vite) or 'build' (CRA).
+- For static: port MUST be 80, dockerfile_content MUST be multi-stage with nginx,
+  include ARG/ENV for VITE_* build args, and COPY nginx.spa.conf.
+- In the returned JSON: `dockerfile_content` must be the COMPLETE Dockerfile.
+- If an existing Dockerfile was provided, prefer adapting it when valid.
 
 Return ONLY the JSON object now.
 """

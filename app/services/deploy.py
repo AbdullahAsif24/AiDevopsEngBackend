@@ -3,10 +3,10 @@
 Strategy (hackathon-reliable):
   1. Tag + push the local image to Docker Hub (public).
   2. Create (or reuse) a Render web service that pulls that image.
-  3. Poll until Render reports a live URL, then return it.
+  3. Poll until a deploy reaches live status, then return the URL.
 
-If credentials are missing we skip deploy cleanly so the build/heal demo still
-works offline. Fly.io / Alibaba are intentionally not wired in v1.
+Critical: Render routes traffic to $PORT (default 10000). We set PORT to the
+app's listen port so Express/Flask images on :3000/:8000 actually receive traffic.
 """
 from __future__ import annotations
 
@@ -83,7 +83,6 @@ def _push_image(
         client.login(username=username, password=token)
 
         _progress(on_progress, f"Pushing {remote}")
-        # push returns a generator of status dicts
         for chunk in client.images.push(
             f"{username}/{remote_repo}", tag=tag, stream=True, decode=True
         ):
@@ -108,20 +107,28 @@ def _create_render_service(
     port: int,
 ) -> tuple[Optional[dict], Optional[str]]:
     """Create a Render web service from a public Docker image."""
+    # PORT tells Render which container port to route to (and many frameworks
+    # also read it). Default Render PORT is 10000 — mismatch causes Not Found.
     payload = {
         "type": "web_service",
-        "name": name[:48],  # Render name length guard
+        "name": name[:48],
         "ownerId": settings.render_owner_id,
         "image": {
             "ownerId": settings.render_owner_id,
             "imagePath": image_path,
         },
+        "envVars": [
+            {"key": "PORT", "value": str(port)},
+            {"key": "HOST", "value": "0.0.0.0"},
+            {"key": "NODE_ENV", "value": "production"},
+        ],
         "serviceDetails": {
             "env": "image",
             "runtime": "image",
             "plan": settings.render_plan,
             "region": settings.render_region,
-            "healthCheckPath": "/health",
+            # "/" is more compatible than /health for Express/static apps.
+            "healthCheckPath": "/",
             "envSpecificDetails": {
                 "dockerCommand": "",
                 "dockerContext": "",
@@ -140,7 +147,6 @@ def _create_render_service(
             if resp.status_code not in (200, 201):
                 return None, f"Render create failed ({resp.status_code}): {resp.text[:800]}"
             data = resp.json()
-            # API wraps as [{ "service": {...} }] or { "service": {...} }
             if isinstance(data, list) and data:
                 svc = data[0].get("service") or data[0]
             else:
@@ -150,63 +156,138 @@ def _create_render_service(
         return None, f"Render API error: {exc}"
 
 
+def _latest_deploy_status(service_id: str) -> tuple[Optional[str], Optional[str]]:
+    """Return (status, error) for the newest deploy on a service."""
+    try:
+        with httpx.Client(timeout=30.0) as client:
+            resp = client.get(
+                f"{RENDER_API}/services/{service_id}/deploys",
+                headers=_render_headers(),
+                params={"limit": 1},
+            )
+            if resp.status_code != 200:
+                return None, f"deploys status {resp.status_code}"
+            data = resp.json()
+            if not data:
+                return None, None
+            dep = data[0].get("deploy") or data[0]
+            return dep.get("status"), None
+    except Exception as exc:
+        return None, str(exc)
+
+
+def _service_url(service_id: str) -> Optional[str]:
+    try:
+        with httpx.Client(timeout=30.0) as client:
+            resp = client.get(
+                f"{RENDER_API}/services/{service_id}",
+                headers=_render_headers(),
+            )
+            if resp.status_code != 200:
+                return None
+            body = resp.json()
+            svc = body.get("service") or body
+            url = (
+                svc.get("serviceDetails", {}).get("url")
+                or svc.get("url")
+                or None
+            )
+            if not url:
+                slug = svc.get("slug") or svc.get("name")
+                if slug:
+                    url = f"https://{slug}.onrender.com"
+            if url and not url.startswith("http"):
+                url = f"https://{url}"
+            return url
+    except Exception:
+        return None
+
+
 def _poll_render_url(
     service_id: str,
-    timeout_s: float = 300.0,
+    timeout_s: float = 480.0,
     on_progress: Optional[Callable[[str], None]] = None,
 ) -> tuple[Optional[str], Optional[str]]:
-    """Poll Render until the service has a public URL or we time out."""
+    """Poll until a deploy is live (not merely until a URL string exists)."""
     deadline = time.monotonic() + timeout_s
-    last_err = "waiting for Render service"
+    last_err = "waiting for Render deploy"
+    terminal_fail = {
+        "build_failed",
+        "update_failed",
+        "canceled",
+        "deactivated",
+        "pre_deploy_failed",
+    }
+    terminal_ok = {"live", "available", "update_succeeded", "succeeded"}
 
     while time.monotonic() < deadline:
-        try:
-            with httpx.Client(timeout=30.0) as client:
-                resp = client.get(
-                    f"{RENDER_API}/services/{service_id}",
-                    headers=_render_headers(),
-                )
-                if resp.status_code != 200:
-                    last_err = f"Render status {resp.status_code}: {resp.text[:200]}"
-                    time.sleep(5)
-                    continue
+        status, err = _latest_deploy_status(service_id)
+        url = _service_url(service_id)
+        _progress(
+            on_progress,
+            f"Render deploy status={status or 'unknown'} url={url or '-'}",
+        )
 
-                body = resp.json()
-                svc = body.get("service") or body
-                # url / serviceDetails.url variants across API versions
-                url = (
-                    svc.get("serviceDetails", {}).get("url")
-                    or svc.get("url")
-                    or None
-                )
-                # Sometimes only the slug is present — compose onrender.com
-                if not url:
-                    slug = svc.get("slug") or svc.get("name")
-                    if slug:
-                        url = f"https://{slug}.onrender.com"
+        if status and status.lower() in terminal_fail:
+            return None, f"Render deploy failed with status={status}"
 
-                state = (
-                    svc.get("serviceDetails", {}).get("state")
-                    or svc.get("state")
-                    or ""
-                )
-                _progress(on_progress, f"Render state={state or 'unknown'} url={url or '-'}")
+        if status and status.lower() in terminal_ok and url:
+            # Quick HTTP probe — prefer a real response over a bare DNS name.
+            try:
+                with httpx.Client(timeout=20.0, follow_redirects=True) as client:
+                    probe = client.get(url)
+                    # 404 from the *app* can still mean routing works; Render edge
+                    # "Not Found" plain text usually means not ready yet.
+                    body = (probe.text or "")[:80]
+                    if probe.status_code == 404 and body.strip().lower() == "not found":
+                        last_err = "URL resolves but service still returning edge Not Found"
+                    else:
+                        return url, None
+            except Exception as exc:
+                last_err = f"probe failed: {exc}"
 
-                if url and state.lower() in ("available", "running", "live", ""):
-                    # Empty state + url is still useful mid-provision.
-                    if state.lower() in ("available", "running", "live") or url:
-                        if state.lower() in ("available", "running", "live"):
-                            return url if url.startswith("http") else f"https://{url}", None
-                        # Have URL but still provisioning — keep waiting a bit
-                        if time.monotonic() + 30 > deadline and url:
-                            return url if url.startswith("http") else f"https://{url}", None
+        if err:
+            last_err = err
 
-        except Exception as exc:
-            last_err = str(exc)
+        time.sleep(10)
 
-        time.sleep(8)
+    return None, f"Timed out waiting for Render live deploy ({last_err})"
 
-    return None, f"Timed out waiting for Render URL ({last_err})"
+
+def fix_service_port(service_id: str, port: int) -> Optional[str]:
+    """Update PORT on an existing service and trigger a redeploy. Returns error or None."""
+    try:
+        with httpx.Client(timeout=60.0) as client:
+            # PUT replaces all env vars for the service.
+            resp = client.put(
+                f"{RENDER_API}/services/{service_id}/env-vars",
+                headers=_render_headers(),
+                json=[
+                    {"key": "PORT", "value": str(port)},
+                    {"key": "HOST", "value": "0.0.0.0"},
+                    {"key": "NODE_ENV", "value": "production"},
+                ],
+            )
+            if resp.status_code not in (200, 201):
+                return f"env-vars update failed ({resp.status_code}): {resp.text[:400]}"
+
+            # Clear overly strict health check if possible via PATCH.
+            client.patch(
+                f"{RENDER_API}/services/{service_id}",
+                headers=_render_headers(),
+                json={"serviceDetails": {"healthCheckPath": "/"}},
+            )
+
+            dep = client.post(
+                f"{RENDER_API}/services/{service_id}/deploys",
+                headers=_render_headers(),
+                json={"clearCache": "clear"},
+            )
+            if dep.status_code not in (200, 201, 202):
+                return f"redeploy failed ({dep.status_code}): {dep.text[:400]}"
+            return None
+    except Exception as exc:
+        return str(exc)
 
 
 def deploy_image(
@@ -231,7 +312,7 @@ def deploy_image(
         return DeployResult(ok=False, error=err or "push failed", image_path=image_path)
 
     service_name = f"aidevops-{job_id}"
-    _progress(on_progress, f"Creating Render service {service_name}")
+    _progress(on_progress, f"Creating Render service {service_name} (PORT={port})")
     svc, err = _create_render_service(service_name, image_path, port)
     if err or not svc:
         return DeployResult(

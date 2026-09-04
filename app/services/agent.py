@@ -27,7 +27,8 @@ from ..contracts import DockerfileError, DockerfileResult, Framework, RepoFinger
 from .fingerprint import build_fingerprint
 from .groq_client import GroqCallError, _query_groq
 from .prompts import build_generation_prompt, build_patch_prompt
-from .templates import describe_templates
+from .stack_detect import detect_framework, guess_static_out_dir, is_vite_spa
+from .templates import describe_templates, render_static_dockerfile
 
 logger = logging.getLogger("aidevops.agent")
 
@@ -115,18 +116,39 @@ async def generate_dockerfile(
     fingerprint = build_fingerprint(repo_path, repo_url or "")
     skeletons = describe_templates()
 
-    # 2. First generation pass.
-    _log("Running Groq generation", job_id)
-    prompt = build_generation_prompt(fingerprint, skeletons)
-    try:
-        current = await _call_and_parse(prompt, job_id)
-    except (GroqCallError, ValidationError) as exc:
-        logger.warning("Generation failed: %s", exc)
-        return DockerfileError(
-            message="Failed to generate Dockerfile from Groq",
-            stage="generating",
-            detail=str(exc),
+    # 1b. Vite/React SPAs get a deterministic nginx multi-stage Dockerfile.
+    #     LLM free-form often emits `npm start` which breaks static frontends.
+    if is_vite_spa(fingerprint):
+        out_dir = guess_static_out_dir(fingerprint)
+        _log(f"Detected Vite/SPA frontend — nginx multi-stage (out={out_dir})", job_id)
+        current = DockerfileResult(
+            language="javascript",
+            framework=Framework.STATIC,
+            entry_point="index.html",
+            port=80,
+            start_command='nginx -g "daemon off;"',
+            dockerfile_content=render_static_dockerfile(
+                framework_note="Vite/React SPA",
+                static_source=out_dir,
+            ),
+            metadata={"stack": "vite_spa", "static_source": out_dir, "detected": True},
         )
+    else:
+        # 2. First generation pass via Groq for node/python/plain static.
+        detected = detect_framework(fingerprint)
+        _log(f"Running Groq generation (detected={detected.value})", job_id)
+        prompt = build_generation_prompt(
+            fingerprint, skeletons, recommended_framework=detected.value
+        )
+        try:
+            current = await _call_and_parse(prompt, job_id)
+        except (GroqCallError, ValidationError) as exc:
+            logger.warning("Generation failed: %s", exc)
+            return DockerfileError(
+                message="Failed to generate Dockerfile from Groq",
+                stage="generating",
+                detail=str(exc),
+            )
 
     # If the caller didn't wire up a build step, hand back the first result.
     if build_fn is None:
@@ -149,6 +171,36 @@ async def generate_dockerfile(
             return current
 
         _log(f"Build failed (heal attempt {attempt}): {last_error[:200]}", job_id)
+
+        # Infrastructure failures can't be fixed by rewriting the Dockerfile.
+        lowered = last_error.lower()
+        if "docker daemon unavailable" in lowered or "docker package not installed" in lowered:
+            return DockerfileError(
+                message="Docker is not available — start Docker Desktop and retry",
+                stage="building",
+                detail=last_error,
+            )
+
+        # SPA out-dir miss: try dist ↔ build before asking Groq.
+        if current.framework == Framework.STATIC and (
+            "dist" in lowered or "build" in lowered or "/app/" in lowered
+        ):
+            alt = "build" if "dist" in current.dockerfile_content else "dist"
+            if f"/app/{alt}" not in current.dockerfile_content:
+                _log(f"SPA heal: switching static output dir → {alt}", job_id)
+                current = DockerfileResult(
+                    language=current.language,
+                    framework=Framework.STATIC,
+                    entry_point=current.entry_point,
+                    port=80,
+                    start_command=current.start_command,
+                    dockerfile_content=render_static_dockerfile(
+                        framework_note="Vite/React SPA",
+                        static_source=alt,
+                    ),
+                    metadata={**current.metadata, "static_source": alt, "healed_attempt": attempt},
+                )
+                continue
 
         # Patch via Groq against the concrete error string.
         patched = await _patch_once(

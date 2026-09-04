@@ -121,6 +121,7 @@ def build_and_test(
     build_timeout_s: float = DEFAULT_BUILD_TIMEOUT_S,
     health_timeout_s: float = DEFAULT_HEALTH_TIMEOUT_S,
     keep_image: bool = True,
+    buildargs: Optional[dict[str, str]] = None,
     on_progress: Optional[Callable[[str], None]] = None,
 ) -> Optional[str]:
     """Build an image from dockerfile_content and confirm the app boots.
@@ -152,6 +153,12 @@ def build_and_test(
 
     try:
         _write_dockerfile(repo_path, dockerfile_content)
+        # SPA template COPY nginx.spa.conf — ensure it exists in the build context.
+        if "nginx.spa.conf" in dockerfile_content:
+            from .templates import ensure_nginx_spa_conf
+
+            ensure_nginx_spa_conf(repo_path)
+
         progress(f"Building image {tag}")
 
         build_logs: list[str] = []
@@ -162,6 +169,7 @@ def build_and_test(
                 tag=tag,
                 rm=True,
                 forcerm=True,
+                buildargs=buildargs or {},
             )
             for chunk in log_gen:
                 line = chunk.get("stream") or chunk.get("status") or chunk.get("error") or ""
@@ -240,6 +248,7 @@ def make_build_fn(
     image_tag: Optional[str] = None,
     build_timeout_s: float = DEFAULT_BUILD_TIMEOUT_S,
     health_timeout_s: float = DEFAULT_HEALTH_TIMEOUT_S,
+    buildargs: Optional[dict[str, str]] = None,
     on_progress: Optional[Callable[[str], None]] = None,
 ) -> Callable[[str], Optional[str]]:
     """Return a sync build_fn(dockerfile_content) -> Optional[error] for agent.py."""
@@ -253,6 +262,7 @@ def make_build_fn(
             build_timeout_s=build_timeout_s,
             health_timeout_s=health_timeout_s,
             keep_image=True,
+            buildargs=buildargs,
             on_progress=on_progress,
         )
 

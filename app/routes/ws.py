@@ -1,57 +1,121 @@
 """WebSocket route that streams JobEvents to the frontend.
 
-The event payload is the stable contract:
-    {job_id, stage, message, timestamp}
+Payload matches the React client contract (mapped stages + status field):
+    {job_id, stage, status, message, timestamp, data?}
 
-Clients can optionally filter to a single job by sending a message containing a
-job_id, or just listen to everything (and filter client-side).
+Clients filter to a single job by sending the job_id as a text message after connect,
+or connect to /ws/jobs/{job_id} which pre-filters.
 """
 from __future__ import annotations
 
 import asyncio
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
+from starlette.websockets import WebSocketState
 
 from ..services.events import hub
+from ..services.frontend_adapter import live_event_to_frontend
+from ..services.jobs import JobNotFound, get_job
 
 router = APIRouter(tags=["websocket"])
 
 
-@router.websocket("/ws/jobs")
-async def ws_jobs(websocket: WebSocket) -> None:
-    """Live event stream for job lifecycle updates."""
+async def _stream(websocket: WebSocket, filtered_job_id: str | None) -> None:
     await websocket.accept()
-
-    # Subscribe to the shared hub; we get every JobEvent on this queue.
     queue = await hub.subscribe()
-    filtered_job_id: str | None = None
+    last_fe_stage: str | None = None
 
     try:
-        # Read a filter message (optional) without blocking the receive loop:
-        # poll our event queue and also watch for an incoming filter.
         while True:
-            # Pull the next event; use a short timeout so we can also check for
-            # client messages / disconnects in between.
-            try:
-                event = await asyncio.wait_for(queue.get(), timeout=0.5)
-            except asyncio.TimeoutError:
-                event = None
+            if websocket.client_state != WebSocketState.CONNECTED:
+                break
 
-            if event is not None and (filtered_job_id is None or event.job_id == filtered_job_id):
-                await websocket.send_json(event.model_dump())
+            get_event = asyncio.create_task(queue.get())
+            get_msg = asyncio.create_task(websocket.receive_text())
+            done, pending = await asyncio.wait(
+                {get_event, get_msg},
+                return_when=asyncio.FIRST_COMPLETED,
+                timeout=30.0,
+            )
 
-            # Opportunistically accept a filter message if the client sent one.
-            try:
-                msg = await asyncio.wait_for(websocket.receive_text(), timeout=0.05)
-                filtered_job_id = msg.strip() or None
-            except Exception:
-                pass  # no message right now; keep streaming
+            # Heartbeat timeout with no activity — keep waiting.
+            if not done:
+                for t in pending:
+                    t.cancel()
+                continue
+
+            for t in pending:
+                t.cancel()
+                try:
+                    await t
+                except (asyncio.CancelledError, Exception):
+                    pass
+
+            if get_msg in done:
+                try:
+                    msg = get_msg.result()
+                    filtered_job_id = (msg or "").strip() or filtered_job_id
+                    last_fe_stage = None
+                except WebSocketDisconnect:
+                    break
+                except Exception:
+                    break
+
+            if get_event in done:
+                try:
+                    event = get_event.result()
+                except Exception:
+                    continue
+
+                if filtered_job_id is not None and event.job_id != filtered_job_id:
+                    continue
+
+                job = None
+                try:
+                    job = await get_job(event.job_id)
+                except JobNotFound:
+                    job = None
+
+                fe = live_event_to_frontend(event, job)
+                fe_stage = fe.get("stage")
+
+                if (
+                    last_fe_stage
+                    and last_fe_stage not in ("done",)
+                    and fe_stage != last_fe_stage
+                    and fe.get("status") != "failed"
+                ):
+                    await websocket.send_json(
+                        {
+                            "job_id": event.job_id,
+                            "stage": last_fe_stage,
+                            "status": "success",
+                            "message": f"{last_fe_stage} complete",
+                            "timestamp": fe.get("timestamp"),
+                        }
+                    )
+
+                await websocket.send_json(fe)
+                last_fe_stage = fe_stage if fe_stage != "done" else "done"
 
     except WebSocketDisconnect:
         pass
+    except Exception:
+        pass
     finally:
         await hub.unsubscribe(queue)
-        try:
-            await websocket.close()
-        except Exception:
-            pass
+        if websocket.client_state == WebSocketState.CONNECTED:
+            try:
+                await websocket.close()
+            except Exception:
+                pass
+
+
+@router.websocket("/ws/jobs")
+async def ws_jobs(websocket: WebSocket) -> None:
+    await _stream(websocket, filtered_job_id=None)
+
+
+@router.websocket("/ws/jobs/{job_id}")
+async def ws_jobs_by_id(websocket: WebSocket, job_id: str) -> None:
+    await _stream(websocket, filtered_job_id=job_id)
