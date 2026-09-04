@@ -14,18 +14,23 @@ RepoSnapshot (temp dir) and its own local variables. `_jobs` only holds records.
 from __future__ import annotations
 
 import asyncio
+import json
 import uuid
 from typing import Optional
 
 from ..contracts import (
+    DeploymentType,
+    DetectionResult,
     DockerfileError,
     DockerfileResult,
+    JobDetection,
     JobEvent,
     JobStage,
     JobStatus,
 )
 from .agent import generate_dockerfile
 from .cloner import CloneError, InvalidRepoURL, clone_repo
+from .deployment_detector import detect_deployment_type
 from .events import hub
 from .github import InvalidRepoURL as GHInvalidURL
 
@@ -102,29 +107,166 @@ async def _run_job(job_id: str) -> None:
         await _log(job, JobStage.CLONING, "Cloning repository")
         # with-block guarantees temp-dir cleanup on success OR failure.
         async with await clone_repo(job.repo_url) as snapshot:
-            # ---- ANALYZE (fingerprint) ----
-            await _log(job, JobStage.ANALYZING, "Analyzing repository structure")
+            job.repo_path = snapshot.root
+            await _record(job)
 
-            # ---- GENERATE (+ self-heal via the caller's build callback) ----
-            await _log(job, JobStage.GENERATING, "Generating Dockerfile via Groq")
+            # ---- DETECT (deployment type) ----
+            # Runs immediately after clone, before any Dockerfile generation.
+            # Branches on detection result (see the switch below).
+            await _log(job, JobStage.ANALYZING, "Detecting deployment type")
+            detection = await validate_detection(job, snapshot.root)
+            if detection is None:
+                return  # job already marked failed/needs_review by validate_detection
 
-            # For v1 we don't call docker ourselves; expose generate only.
-            # The DevOps engineer injects a `build_fn` to drive the heal loop;
-            # without one we stop after generation and mark done with a result.
-            result = await _generate_with_healing(job, snapshot.root)
+            # ---- ANALYZE (fingerprint) / Dockerfile branch ----
+            if detection.needs_dockerfile:
+                # Container path: generate a Dockerfile.
+                await _log(job, JobStage.GENERATING, "Generating Dockerfile via Groq")
 
-            if isinstance(result, DockerfileError):
-                job.error = result.message + (f": {result.detail}" if result.detail else "")
-                await _log(job, JobStage.FAILED, job.error)
-                return
+                # For v1 we don't call docker ourselves; expose generate only.
+                result = await _generate_with_healing(job, snapshot.root)
 
-            job.result = result
-            await _log(job, JobStage.DONE, "Dockerfile generated successfully")
+                if isinstance(result, DockerfileError):
+                    job.error = result.message + (f": {result.detail}" if result.detail else "")
+                    await _log(job, JobStage.FAILED, job.error)
+                    return
+
+                job.result = result
+                await _log(job, JobStage.DONE, "Dockerfile generated successfully")
+            elif detection.deployment_type in (DeploymentType.STATIC, DeploymentType.VERCEL_NATIVE):
+                # Static / Vercel-native path: no Dockerfile, deploy straight to Vercel.
+                await _log(
+                    job,
+                    JobStage.DONE,
+                    f"{detection.detected_framework}: no Dockerfile needed, deploying to Vercel",
+                )
+            else:
+                # AMBIGUOUS handled inside validate_detection (job paused for review).
+                pass
 
     except (CloneError, InvalidRepoURL, GHInvalidURL) as exc:
         await _log(job, JobStage.FAILED, f"Clone/validation failed: {exc}")
     except Exception as exc:  # broad safety net — never let a task die silently
         await _log(job, JobStage.FAILED, f"Unexpected error: {exc}")
+
+
+async def validate_detection(job: JobStatus, repo_path: str) -> Optional[DetectionResult]:
+    """Run deployment detection for a job and persist + broadcast the result.
+
+    * Persists a JobDetection onto the job and emits a
+      {"step": "detection", "status": "complete", "result": {...}} WebSocket
+      event so the dashboard shows it live.
+    * For AMBIGUOUS results, flips the job into NEEDS_REVIEW and pauses the
+      pipeline until the user calls POST /jobs/{id}/override-detection.
+    * Returns the DetectionResult, or None if the pipeline should stop (paused
+      for review or detection failed hard).
+
+    The whole detection call is wrapped so a bad repo can never kill the job.
+    """
+    try:
+        result = await detect_deployment_type(repo_path)
+    except Exception as exc:  # broad safety net — never let detection kill the job
+        result = DetectionResult(
+            deployment_type=DeploymentType.AMBIGUOUS,
+            confidence="low",
+            detected_framework="unknown",
+            reasoning="Deployment detection failed",
+            needs_dockerfile=False,
+            detection_method="rule_based",
+            ambiguous_reason=f"Detection service unavailable, manual classification required: {exc}",
+        )
+
+    # Persist a flat snapshot of the detection on the job record.
+    job.detection = JobDetection(
+        deployment_type=result.deployment_type,
+        needs_dockerfile=result.needs_dockerfile,
+        detected_framework=result.detected_framework,
+        entry_point=result.entry_point,
+        listen_port=result.listen_port,
+        reasoning=result.reasoning,
+        detection_method=result.detection_method,
+    )
+    job.status = (
+        JobStage.NEEDS_REVIEW
+        if result.deployment_type == DeploymentType.AMBIGUOUS
+        else job.status
+    )
+    await _record(job)
+
+    # Emit the structured detection event (stable dashboard payload).
+    await hub.publish(_detection_event(job.job_id, result))
+
+    # If ambiguous, pause the pipeline for manual review.
+    if result.deployment_type == DeploymentType.AMBIGUOUS:
+        reason = result.ambiguous_reason or result.reasoning or "unknown"
+        await _log(
+            job,
+            JobStage.NEEDS_REVIEW,
+            f"Deployment type ambiguous ({reason}). "
+            "Waiting for manual override via POST /jobs/{id}/override-detection.",
+        )
+        return None
+
+    return result
+
+
+def _detection_event(job_id: str, result: DetectionResult) -> JobEvent:
+    """Wrap a DetectionResult into the event hub's {step,status,result} payload."""
+    message = json.dumps(
+        {
+            "step": "detection",
+            "status": "complete",
+            "result": result.model_dump(),
+        }
+    )
+    return JobEvent(
+        job_id=job_id,
+        stage=JobStage.ANALYZING,
+        message=message,
+    )
+
+
+async def override_detection(job_id: str, deployment_type: DeploymentType) -> DetectionResult:
+    """Manually confirm a deployment type for an AMBIGUOUS job.
+
+    Persists the override and marks the job ready to resume so the pipeline can
+    continue. Returns a DetectionResult reflecting the manual classification.
+
+    Raises JobNotFound if the job doesn't exist.
+    """
+    async with _jobs_lock:
+        job = _JOBS.get(job_id)
+    if job is None:
+        raise JobNotFound(job_id)
+
+    framework = job.detection.detected_framework if job.detection else "unknown"
+    entry_point = job.detection.entry_point if job.detection else None
+    listen_port = job.detection.listen_port if job.detection else None
+    method = job.detection.detection_method if job.detection else "rule_based"
+
+    result = DetectionResult(
+        deployment_type=deployment_type,
+        confidence="high",
+        detected_framework=framework,
+        entry_point=entry_point,
+        listen_port=listen_port,
+        reasoning="Manually confirmed by user via override endpoint.",
+        needs_dockerfile=deployment_type == DeploymentType.CONTAINER,
+        detection_method=method,
+    )
+
+    job.detection = JobDetection(
+        deployment_type=deployment_type,
+        needs_dockerfile=result.needs_dockerfile,
+        detected_framework=framework,
+        entry_point=entry_point,
+        listen_port=listen_port,
+        reasoning=result.reasoning,
+        detection_method=method,
+    )
+    job.status = JobStage.QUEUED  # unblock the paused pipeline
+    await _record(job)
+    return result
 
 
 async def _generate_with_healing(
@@ -158,3 +300,11 @@ async def get_job(job_id: str) -> JobStatus:
     if job is None:
         raise JobNotFound(job_id)
     return job
+
+
+async def list_jobs() -> list[JobStatus]:
+    """Return all jobs, most recently created first."""
+    async with _jobs_lock:
+        jobs = list(_JOBS.values())
+    jobs.sort(key=lambda j: j.created_at, reverse=True)
+    return jobs

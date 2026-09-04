@@ -6,7 +6,7 @@ from pydantic import BaseModel, Field
 
 from ..contracts import JobStatus
 from ..services.github import InvalidRepoURL, parse_github_url
-from ..services.jobs import JobNotFound, get_job, make_job, schedule_job
+from ..services.jobs import JobNotFound, get_job, list_jobs, make_job, schedule_job
 
 router = APIRouter(prefix="/jobs", tags=["jobs"])
 
@@ -40,6 +40,12 @@ async def create_job(payload: CreateJobRequest) -> CreateJobResponse:
     job = make_job(payload.repo_url)
     await schedule_job(job)
     return CreateJobResponse(job_id=job.job_id, status=job.status.value)
+
+
+@router.get("", response_model=list[JobStatus])
+async def read_jobs() -> list[JobStatus]:
+    """List all known jobs (most recent first) for the History view."""
+    return await list_jobs()
 
 
 @router.get("/{job_id}", response_model=JobStatus)

@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Optional
+from typing import Literal, Optional
 
 from pydantic import BaseModel, Field
 
@@ -42,6 +42,7 @@ class JobStage(str, Enum):
     HEALING = "healing"
     DONE = "done"
     FAILED = "failed"
+    NEEDS_REVIEW = "needs_review"
 
 
 class Framework(str, Enum):
@@ -50,6 +51,43 @@ class Framework(str, Enum):
     NODE = "node"
     PYTHON = "python"
     STATIC = "static"
+
+
+# ---------------------------------------------------------------------------
+# Deployment detection
+# ---------------------------------------------------------------------------
+class DeploymentType(str, Enum):
+    """How a repo should be deployed.
+
+    * STATIC         -> pure frontend/static site -> deploy straight to Vercel.
+    * VERCEL_NATIVE  -> framework with a first-class Vercel preset -> deploy to
+                        Vercel without a Dockerfile.
+    * CONTAINER      -> a backend that needs a Dockerfile -> Render/Railway.
+    * AMBIGUOUS      -> couldn't confidently classify -> manual review.
+    """
+
+    STATIC = "static"
+    VERCEL_NATIVE = "vercel_native"
+    CONTAINER = "container"
+    AMBIGUOUS = "ambiguous"
+
+
+class DetectionResult(BaseModel):
+    """Outcome of deployment-type detection for a cloned repo.
+
+    Used to branch the pipeline: `needs_dockerfile` decides whether we run the
+    Dockerfile generation step or skip straight to Vercel deploy.
+    """
+
+    deployment_type: DeploymentType
+    confidence: Literal["high", "medium", "low"]
+    detected_framework: str
+    entry_point: Optional[str] = None
+    listen_port: Optional[int] = None
+    reasoning: str
+    needs_dockerfile: bool
+    ambiguous_reason: Optional[str] = None
+    detection_method: Literal["rule_based", "llm"]
 
 
 # ---------------------------------------------------------------------------
@@ -124,12 +162,33 @@ class JobEvent(BaseModel):
     timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 
+class JobDetection(BaseModel):
+    """Deployment detection fields persisted on a job.
+
+    These mirror DetectionResult but are stored flatly on the job record so the
+    pipeline can branch (needs_dockerfile) and the UI can render a summary.
+    """
+
+    deployment_type: DeploymentType
+    needs_dockerfile: bool
+    detected_framework: str = ""
+    entry_point: Optional[str] = None
+    listen_port: Optional[int] = None
+    reasoning: str = ""
+    detection_method: str = "rule_based"
+
+
 class JobStatus(BaseModel):
     """Snapshot returned by GET /jobs/{id}."""
 
     job_id: str
     status: JobStage
     repo_url: str
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     logs: list[JobEvent] = Field(default_factory=list)
     result: Optional[DockerfileResult] = None
     error: Optional[str] = None
+    # Local clone path, populated once the repo has been cloned by the pipeline.
+    repo_path: Optional[str] = None
+    # Deployment detection output (populated once the detector has run).
+    detection: Optional[JobDetection] = None
