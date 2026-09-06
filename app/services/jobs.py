@@ -20,6 +20,7 @@ from typing import Optional
 
 from ..contracts import (
     DeploymentType,
+    DeploymentResult,
     DetectionResult,
     DockerfileError,
     DockerfileResult,
@@ -33,6 +34,8 @@ from .cloner import CloneError, InvalidRepoURL, clone_repo
 from .deployment_detector import detect_deployment_type
 from .events import hub
 from .github import InvalidRepoURL as GHInvalidURL
+from .vercel_deploy import VercelDeployError, deploy_to_vercel
+from .render_deploy import RenderDeployError, deploy_to_render
 
 # The StatusNotFound sentinel lets callers distinguish "no such job" from a
 # genuinely empty record without leaking a sentinel instance.
@@ -133,13 +136,51 @@ async def _run_job(job_id: str) -> None:
 
                 job.result = result
                 await _log(job, JobStage.DONE, "Dockerfile generated successfully")
+                
+                # Deploy to Render
+                await _log(job, JobStage.DEPLOYING, "Deploying to Render")
+                try:
+                    deployment_result = await deploy_to_render(
+                        repo_path=snapshot.root,
+                        service_name=f"{job.job_id}-service",
+                        dockerfile_content=result.dockerfile_content,
+                    )
+                    job.deployment = deployment_result
+                    await _log(
+                        job,
+                        JobStage.DONE,
+                        f"Render deployment configured: {deployment_result.deployment_url}. {deployment_result.message}",
+                    )
+                except RenderDeployError as exc:
+                    job.error = f"Render deployment failed: {exc}"
+                    await _log(job, JobStage.FAILED, job.error)
+                    return
+                    
             elif detection.deployment_type in (DeploymentType.STATIC, DeploymentType.VERCEL_NATIVE):
                 # Static / Vercel-native path: no Dockerfile, deploy straight to Vercel.
-                await _log(
-                    job,
-                    JobStage.DONE,
-                    f"{detection.detected_framework}: no Dockerfile needed, deploying to Vercel",
-                )
+                await _log(job, JobStage.DEPLOYING, f"Deploying {detection.detected_framework} to Vercel")
+                try:
+                    # Generate a Vercel-compatible project name
+                    import re
+                    safe_name = re.sub(r'[^a-zA-Z0-9-_]', '-', job.job_id)
+                    safe_name = safe_name[:52]  # Keep it under 52 chars to leave room for suffix
+                    project_name = f"app-{safe_name}"
+                    
+                    deployment_result = await deploy_to_vercel(
+                        repo_path=snapshot.root,
+                        project_name=project_name,
+                        framework=detection.detected_framework,
+                    )
+                    job.deployment = deployment_result
+                    await _log(
+                        job,
+                        JobStage.DONE,
+                        f"Vercel deployment configured: {deployment_result.deployment_url}. {deployment_result.message}",
+                    )
+                except VercelDeployError as exc:
+                    job.error = f"Vercel deployment failed: {exc}"
+                    await _log(job, JobStage.FAILED, job.error)
+                    return
             else:
                 # AMBIGUOUS handled inside validate_detection (job paused for review).
                 pass

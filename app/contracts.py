@@ -30,6 +30,7 @@ class JobStage(str, Enum):
     `generating` -> first Groq pass to produce a Dockerfile
     `building` -> (owned by DevOps) Docker build in progress
     `healing` -> a build failed and we are patching via Groq
+    `deploying` -> deploying to Vercel or Render
     `done` -> success, result available
     `failed` -> terminal failure (error surfaced)
     """
@@ -40,6 +41,7 @@ class JobStage(str, Enum):
     GENERATING = "generating"
     BUILDING = "building"
     HEALING = "healing"
+    DEPLOYING = "deploying"
     DONE = "done"
     FAILED = "failed"
     NEEDS_REVIEW = "needs_review"
@@ -88,6 +90,16 @@ class DetectionResult(BaseModel):
     needs_dockerfile: bool
     ambiguous_reason: Optional[str] = None
     detection_method: Literal["rule_based", "llm"]
+
+
+class DeploymentResult(BaseModel):
+    """Result of a deployment to Vercel or Render."""
+
+    platform: Literal["vercel", "render"]
+    deployment_url: str
+    deployment_id: str
+    status: str
+    message: str
 
 
 # ---------------------------------------------------------------------------
@@ -192,3 +204,5 @@ class JobStatus(BaseModel):
     repo_path: Optional[str] = None
     # Deployment detection output (populated once the detector has run).
     detection: Optional[JobDetection] = None
+    # Deployment result (populated after successful deployment).
+    deployment: Optional[DeploymentResult] = None

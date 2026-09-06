@@ -29,5 +29,22 @@ class Settings:
     # 3 retries (plus the initial generation) is plenty for a hackathon.
     max_heal_retries: int = int(os.getenv("MAX_HEAL_RETRIES", "3"))
 
+    # Vercel deployment configuration
+    vercel_api_token: str = os.getenv("VERCEL_API_TOKEN", "")
+    vercel_team_id: str = os.getenv("VERCEL_TEAM_ID", "")  # Optional: for team deployments
+
+    # Render deployment configuration
+    render_api_key: str = os.getenv("RENDER_API_KEY", "")
+
 
 settings = Settings()
+
+
+def vercel_configured() -> bool:
+    """Check if Vercel deployment is properly configured."""
+    return bool(settings.vercel_api_token)
+
+
+def render_configured() -> bool:
+    """Check if Render deployment is properly configured."""
+    return bool(settings.render_api_key)

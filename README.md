@@ -17,7 +17,6 @@ The system features an autonomous **self-healing retry loop** powered by Groq LL
   - [Environment Variables](#environment-variables)
   - [Running the Server](#running-the-server)
 - [Complete API Reference](#-complete-api-reference)
-  - [1. Health Check (`GET /health`)](#1-health-check-get-health)
   - [2. Create Job (`POST /jobs`)](#2-create-job-post-jobs)
   - [3. Get Job Status (`GET /jobs/{job_id}`)](#3-get-job-status-get-jobsjob_id)
   - [4. Real-Time WebSocket Stream (`WS /ws/jobs`)](#4-real-time-websocket-stream-ws-wsjobs)

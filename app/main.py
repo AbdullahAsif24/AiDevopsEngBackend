@@ -12,12 +12,13 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from .routes import jobs as jobs_router
 from .routes import detection as detection_router
+from .routes import deployments as deployments_router
 from .routes import ws as ws_router
 
 app = FastAPI(
     title="AI DevOps Engineer Backend",
-    description="Turns a GitHub repo URL into a Dockerfile via Groq, with a self-healing retry loop.",
-    version="0.1.0",
+    description="Turns a GitHub repo URL into a Dockerfile via Groq, deploys to Vercel/Render with intelligent detection.",
+    version="0.3.0",
 )
 
 # Allow the React dev server (and any local frontend) to call us during the
@@ -32,10 +33,19 @@ app.add_middleware(
 
 app.include_router(jobs_router.router)
 app.include_router(detection_router.router)
+app.include_router(deployments_router.router)
 app.include_router(ws_router.router)
 
 
 @app.get("/health")
 async def health() -> dict:
-    """Simple liveness probe."""
-    return {"status": "ok"}
+    """Liveness probe plus optional deployment capability flags (no secrets)."""
+    from .config import settings, vercel_configured, render_configured
+
+    return {
+        "status": "ok",
+        "version": "0.3.0",
+        "vercel": "configured" if vercel_configured() else "not_configured",
+        "render": "configured" if render_configured() else "not_configured",
+        "deployment_mode": "configuration_only",  # For hackathon: creates configs, requires manual GitHub linking
+    }
