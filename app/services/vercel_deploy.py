@@ -1,12 +1,15 @@
-"""Vercel deployment service for frontend applications.
-
-This module handles deployment of static sites and Vercel-native frameworks
-(Next.js, Nuxt, SvelteKit, etc.) to Vercel using their REST API.
-"""
+"""Deploy frontend apps to Vercel from source files (real production URLs)."""
 from __future__ import annotations
 
+import asyncio
+import hashlib
+import os
+import re
+from pathlib import Path
+from typing import Any, Optional
+
 import httpx
-from typing import Optional
+
 from ..config import settings
 from ..contracts import DeploymentResult
 
@@ -15,329 +18,262 @@ class VercelDeployError(Exception):
     """Raised when Vercel deployment fails."""
 
 
+_SKIP_DIRS = {
+    ".git",
+    "node_modules",
+    ".next",
+    "dist",
+    "build",
+    "coverage",
+    ".venv",
+    "venv",
+    "__pycache__",
+    ".turbo",
+    ".output",
+    ".cache",
+    ".idea",
+    ".vscode",
+    ".pnpm-store",
+}
+_SKIP_FILES = {".DS_Store", "Thumbs.db", ".env", ".env.local", ".env.production"}
+_MAX_FILE_BYTES = 8 * 1024 * 1024
+_MAX_FILES = 4000
+
+
+def _auth_headers(access_token: str) -> dict[str, str]:
+    return {"Authorization": f"Bearer {access_token}"}
+
+
+def _team_params() -> dict[str, str]:
+    if settings.vercel_team_id:
+        return {"teamId": settings.vercel_team_id}
+    return {}
+
+
+def sanitize_project_name(name: str) -> str:
+    cleaned = re.sub(r"[^a-z0-9._-]", "-", name.lower())
+    cleaned = re.sub(r"-{2,}", "-", cleaned).strip("-.")
+    return (cleaned[:100] or "frontend-app")
+
+
+def vercel_framework_slug(framework: str) -> Optional[str]:
+    text = (framework or "").lower()
+    mapping = (
+        ("next", "nextjs"),
+        ("nuxt", "nuxtjs"),
+        ("svelte", "sveltekit-1"),
+        ("remix", "remix"),
+        ("astro", "astro"),
+        ("gatsby", "gatsby"),
+        ("angular", "angular"),
+        ("vue", "vue"),
+        ("vite", "vite"),
+        ("create-react-app", "create-react-app"),
+        ("cra", "create-react-app"),
+        ("react", "vite"),
+    )
+    for needle, slug in mapping:
+        if needle in text:
+            return slug
+    return None
+
+
+def collect_source_files(repo_path: str) -> list[tuple[str, bytes, str]]:
+    root = Path(repo_path)
+    collected: list[tuple[str, bytes, str]] = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in _SKIP_DIRS]
+        for fname in filenames:
+            if fname in _SKIP_FILES:
+                continue
+            full = Path(dirpath) / fname
+            rel = full.relative_to(root).as_posix()
+            try:
+                if full.stat().st_size > _MAX_FILE_BYTES:
+                    continue
+                data = full.read_bytes()
+            except OSError:
+                continue
+            collected.append((rel, data, hashlib.sha1(data).hexdigest()))
+            if len(collected) >= _MAX_FILES:
+                return collected
+    return collected
+
+
+def to_https(host_or_url: str) -> str:
+    value = host_or_url.strip().rstrip(".,);")
+    if value.startswith(("http://", "https://")):
+        return value
+    return f"https://{value}"
+
+
+def pick_public_url(deployment: dict[str, Any]) -> str:
+    aliases = deployment.get("alias") or deployment.get("aliases") or []
+    candidates: list[str] = []
+    if isinstance(aliases, list):
+        candidates.extend(str(item) for item in aliases if item)
+    url = deployment.get("url") or ""
+    if url:
+        candidates.append(str(url))
+
+    cleaned: list[str] = []
+    for candidate in candidates:
+        if "vercel.com/" in candidate and ".vercel.app" not in candidate:
+            continue
+        cleaned.append(to_https(candidate))
+    if not cleaned:
+        raise VercelDeployError("Vercel returned no public deployment URL")
+
+    production = [
+        item
+        for item in cleaned
+        if ".vercel.app" in item and "--" not in item.split("://", 1)[-1]
+    ]
+    return production[0] if production else cleaned[0]
+
+
 async def deploy_to_vercel(
     repo_path: str,
     project_name: str,
     framework: str,
+    access_token: str,
+    env_vars: dict[str, str] | None = None,
 ) -> DeploymentResult:
-    """Deploy a frontend project to Vercel.
-
-    This creates a Vercel project configuration and provides deployment instructions.
-    Due to Vercel's API limitations, actual deployment requires either:
-    1. Git integration (recommended for production)
-    2. Vercel CLI installation
-    3. Manual deployment through Vercel dashboard
+    """Upload source to Vercel, wait until READY, return the live https URL.
 
     Args:
-        repo_path: Local path to the cloned repository
+        repo_path: Path to the repository to deploy
         project_name: Name for the Vercel project
-        framework: Detected framework (Next.js, React, etc.)
+        framework: Detected framework type
+        access_token: User's Vercel access token
+        env_vars: Optional environment variables to inject
 
     Returns:
         DeploymentResult with deployment URL and status
-
-    Raises:
-        VercelDeployError: If deployment fails
     """
-    if not settings.vercel_api_token:
-        raise VercelDeployError("VERCEL_API_TOKEN not configured")
+    if not access_token:
+        raise VercelDeployError("Vercel access token not provided")
 
-    headers = {
-        "Authorization": f"Bearer {settings.vercel_api_token}",
-        "Content-Type": "application/json",
+    name = sanitize_project_name(project_name)
+    files = collect_source_files(repo_path)
+    if not files:
+        raise VercelDeployError("No source files found to deploy")
+
+    timeout = httpx.Timeout(30.0, read=180.0)
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        file_refs = await _upload_files(client, files, access_token)
+        deployment = await _create_deployment(
+            client, name, framework, file_refs, access_token, env_vars
+        )
+        deployment_id = deployment.get("id") or deployment.get("uid")
+        if not deployment_id:
+            raise VercelDeployError("Vercel did not return a deployment id")
+
+        ready = await _wait_until_ready(client, str(deployment_id), access_token)
+        public_url = pick_public_url(ready)
+        return DeploymentResult(
+            platform="vercel",
+            deployment_url=public_url,
+            deployment_id=str(deployment_id),
+            status="deployed",
+            message=f"Successfully deployed to Vercel. Live at {public_url}",
+        )
+
+
+async def _upload_files(
+    client: httpx.AsyncClient,
+    files: list[tuple[str, bytes, str]],
+    access_token: str,
+) -> list[dict[str, Any]]:
+    sem = asyncio.Semaphore(6)
+
+    async def upload(rel: str, data: bytes, sha: str) -> dict[str, Any]:
+        async with sem:
+            response = await client.post(
+                "https://api.vercel.com/v2/files",
+                params=_team_params(),
+                headers={
+                    **_auth_headers(access_token),
+                    "Content-Type": "application/octet-stream",
+                    "Content-Length": str(len(data)),
+                    "x-vercel-digest": sha,
+                },
+                content=data,
+            )
+            if response.status_code not in (200, 201):
+                raise VercelDeployError(
+                    f"Failed to upload {rel}: {response.status_code} {response.text[:400]}"
+                )
+            return {"file": rel, "sha": sha, "size": len(data)}
+
+    return list(await asyncio.gather(*[upload(*item) for item in files]))
+
+
+async def _create_deployment(
+    client: httpx.AsyncClient,
+    name: str,
+    framework: str,
+    file_refs: list[dict[str, Any]],
+    access_token: str,
+    env_vars: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    slug = vercel_framework_slug(framework)
+    project_settings: dict[str, Any] = {}
+    if slug:
+        project_settings["framework"] = slug
+
+    body: dict[str, Any] = {
+        "name": name,
+        "project": name,
+        "target": "production",
+        "files": file_refs,
+        "projectSettings": project_settings,
     }
 
-    # Add team ID if configured
-    team_id_param = f"?teamId={settings.vercel_team_id}" if settings.vercel_team_id else ""
+    # Add environment variables if provided
+    if env_vars:
+        body["env"] = [
+            {"key": key, "value": value, "type": "encrypted"}
+            for key, value in env_vars.items()
+        ]
 
-    async with httpx.AsyncClient(timeout=60.0) as client:
-        try:
-            # Step 1: Build the project locally
-            import subprocess
-            import os
-            
-            # Install dependencies
-            print(f"Installing dependencies for {project_name}...")
-            npm_install = subprocess.run(
-                "npm install",
-                capture_output=True,
-                text=True,
-                timeout=300,
-                shell=True,
-                cwd=repo_path  # Ensure we run in the correct directory
+    params = {
+        **_team_params(),
+        "skipAutoDetectionConfirmation": 1,
+        "forceNew": 1,
+    }
+    response = await client.post(
+        "https://api.vercel.com/v13/deployments",
+        params=params,
+        headers={**_auth_headers(access_token), "Content-Type": "application/json"},
+        json=body,
+    )
+    if response.status_code not in (200, 201):
+        raise VercelDeployError(
+            f"Vercel create deployment failed: {response.status_code} {response.text[:800]}"
+        )
+    return response.json()
+
+
+async def _wait_until_ready(
+    client: httpx.AsyncClient, deployment_id: str, access_token: str
+) -> dict[str, Any]:
+    for _ in range(90):
+        response = await client.get(
+            f"https://api.vercel.com/v13/deployments/{deployment_id}",
+            params=_team_params(),
+            headers=_auth_headers(access_token),
+        )
+        if response.status_code != 200:
+            raise VercelDeployError(
+                f"Failed to poll Vercel deployment: {response.status_code} {response.text[:400]}"
             )
-            
-            if npm_install.returncode != 0:
-                raise VercelDeployError(f"npm install failed: {npm_install.stderr}")
-            
-            # Build the project
-            print(f"Building {project_name}...")
-            build_command = _get_build_command(framework)
-            
-            npm_build = subprocess.run(
-                build_command,
-                capture_output=True,
-                text=True,
-                timeout=300,
-                shell=True,
-                cwd=repo_path  # Ensure we run in the correct directory
-            )
-            
-            if npm_build.returncode != 0:
-                raise VercelDeployError(f"Build failed: {npm_build.stderr}")
-
-            # Step 2: Sanitize project name for Vercel requirements
-            sanitized_name = project_name.lower()
-            sanitized_name = ''.join(c for c in sanitized_name if c.isalnum() or c in '.-_')
-            while '---' in sanitized_name:
-                sanitized_name = sanitized_name.replace('---', '--')
-            sanitized_name = sanitized_name.strip('-')
-            sanitized_name = sanitized_name[:100]
-            
-            if not sanitized_name:
-                sanitized_name = "frontend-project"
-            
-            print(f"Using sanitized project name: {sanitized_name}")
-            
-            # Create or get the Vercel project
-            project_url = f"https://api.vercel.com/v8/projects{team_id_param}"
-            
-            # Check if project already exists
-            existing_projects = await client.get(project_url, headers=headers)
-            if existing_projects.status_code == 200:
-                projects_data = existing_projects.json()
-                existing_project = None
-                for project in projects_data.get("projects", []):
-                    if project["name"] == sanitized_name:
-                        existing_project = project
-                        break
-                
-                if existing_project:
-                    project_id = existing_project["id"]
-                else:
-                    # Create new project
-                    create_response = await client.post(
-                        project_url,
-                        headers=headers,
-                        json={
-                            "name": sanitized_name,
-                            "framework": framework.lower() if framework != "Vercel" else None,
-                            "buildCommand": _get_build_command(framework),
-                            "outputDirectory": _get_output_directory(framework),
-                        }
-                    )
-                    if create_response.status_code not in (200, 201):
-                        raise VercelDeployError(f"Failed to create Vercel project: {create_response.text}")
-                    
-                    project_data = create_response.json()
-                    project_id = project_data["id"]
-            else:
-                raise VercelDeployError(f"Failed to fetch existing projects: {existing_projects.text}")
-
-            # Step 3: Deploy the built files using Vercel's deployment API with file upload
-            import zipfile
-            import io
-            import base64
-            
-            output_dir = _get_output_directory(framework)
-            build_path = os.path.join(repo_path, output_dir)
-            
-            if not os.path.exists(build_path):
-                raise VercelDeployError(f"Build output directory not found: {build_path}")
-            
-            # Create a zip file of the built files
-            print(f"Creating deployment package...")
-            zip_buffer = io.BytesIO()
-            with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
-                for root, dirs, file_names in os.walk(build_path):
-                    for file_name in file_names:
-                        file_path = os.path.join(root, file_name)
-                        relative_path = os.path.relpath(file_path, build_path)
-                        # Use forward slashes for Vercel
-                        arcname = relative_path.replace('\\', '/')
-                        zip_file.write(file_path, arcname)
-            
-            zip_buffer.seek(0)
-            zip_data = zip_buffer.getvalue()
-            
-            # Upload the zip file using Vercel's deployment API
-            print(f"Uploading to Vercel...")
-            deployment_url = f"https://api.vercel.com/v13/deployments{team_id_param}"
-            
-            # Use multipart/form-data for file upload
-            files = {
-                'file': ('deployment.zip', zip_data, 'application/zip')
-            }
-            
-            deploy_response = await client.post(
-                deployment_url,
-                headers={
-                    "Authorization": f"Bearer {settings.vercel_api_token}",
-                },
-                files=files,
-                data={
-                    "name": project_name,
-                    "project": project_id,
-                    "target": "production"
-                }
-            )
-            
-            if deploy_response.status_code not in (200, 201):
-                error_detail = deploy_response.text
-                print(f"Deployment failed: {error_detail}")
-                # Try alternative approach using git-based deployment
-                pass
-            else:
-                deployment_data = deploy_response.json()
-                deployment_id = deployment_data.get("id", "")
-                deployment_url_final = deployment_data.get("url", "")
-                
-                if deployment_url_final:
-                    return DeploymentResult(
-                        platform="vercel",
-                        deployment_url=deployment_url_final,
-                        deployment_id=deployment_id,
-                        status="deployed",
-                        message=f"Successfully deployed '{project_name}' to Vercel. Available at {deployment_url_final}",
-                    )
-            
-            # Alternative: Use Vercel CLI for reliable deployment
-            print(f"Attempting Vercel CLI deployment...")
-            
-            # First check if vercel CLI is available
-            vercel_check = subprocess.run(
-                "vercel --version",
-                capture_output=True,
-                text=True,
-                timeout=30,
-                shell=True
-            )
-            
-            if vercel_check.returncode != 0:
-                print(f"Vercel CLI not found, installing...")
-                subprocess.run(
-                    "npm install -g vercel",
-                    capture_output=True,
-                    text=True,
-                    timeout=120,
-                    shell=True
-                )
-            
-            # Set up environment for non-interactive deployment
-            env = os.environ.copy()
-            env["VERCEL_TOKEN"] = settings.vercel_api_token
-            
-            # Create/update vercel.json file for the project
-            vercel_config_path = os.path.join(repo_path, "vercel.json")
-            with open(vercel_config_path, 'w') as f:
-                f.write(f'{{"name": "{sanitized_name}", "version": 2}}')
-            
-            # Try to deploy using Vercel CLI
-            # Use --yes flag to skip confirmation prompts
-            vercel_deploy = subprocess.run(
-                f"vercel --prod --yes --token={settings.vercel_api_token}",
-                capture_output=True,
-                text=True,
-                timeout=300,
-                shell=True,
-                cwd=repo_path,
-                env=env
-            )
-            
-            print(f"Vercel CLI return code: {vercel_deploy.returncode}")
-            print(f"Vercel CLI stdout: {vercel_deploy.stdout}")
-            print(f"Vercel CLI stderr: {vercel_deploy.stderr}")
-            
-            if vercel_deploy.returncode == 0:
-                # Extract deployment URL from output
-                output_lines = vercel_deploy.stdout.split('\n')
-                deployment_url = None
-                aliased_url = None
-                
-                for line in output_lines:
-                    if '▲ Aliased' in line and 'https://' in line and '.vercel.app' in line:
-                        # This is the clean aliased URL (the one we want)
-                        url_parts = line.split()
-                        for part in url_parts:
-                            if 'https://' in part and '.vercel.app' in part:
-                                aliased_url = part.strip()
-                                break
-                    elif 'Production' in line and 'https://' in line and '.vercel.app' in line:
-                        # This is the production URL (may have hash)
-                        url_parts = line.split()
-                        for part in url_parts:
-                            if 'https://' in part and '.vercel.app' in part:
-                                deployment_url = part.strip()
-                                break
-                
-                # Prefer the aliased URL if available, otherwise use production URL
-                final_url = aliased_url if aliased_url else deployment_url
-                
-                if final_url:
-                    return DeploymentResult(
-                        platform="vercel",
-                        deployment_url=final_url,
-                        deployment_id=project_id,
-                        status="deployed",
-                        message=f"Successfully deployed '{sanitized_name}' to Vercel using CLI. Available at {final_url}",
-                    )
-            
-            # Final fallback: Return the production URL with instructions
-            production_url = f"https://{sanitized_name}.vercel.app"
-            
-            return DeploymentResult(
-                platform="vercel",
-                deployment_url=production_url,
-                deployment_id=project_id,
-                status="deployed",
-                message=f"Vercel project '{sanitized_name}' created and built successfully. Production URL: {production_url}. To complete deployment: Connect your GitHub repository in Vercel dashboard or run 'vercel --prod' in the project directory.",
-            )
-
-        except httpx.HTTPError as exc:
-            raise VercelDeployError(f"HTTP error during Vercel deployment: {exc}")
-        except subprocess.TimeoutExpired:
-            raise VercelDeployError("Build process timed out")
-        except Exception as exc:
-            raise VercelDeployError(f"Unexpected error during Vercel deployment: {exc}")
-
-
-def _get_build_command(framework: str) -> str:
-    """Get appropriate build command for framework."""
-    framework_lower = framework.lower()
-    
-    if "next" in framework_lower:
-        return "next build"
-    elif "nuxt" in framework_lower:
-        return "nuxt build"
-    elif "svelte" in framework_lower:
-        return "npm run build"
-    elif "react" in framework_lower or "cra" in framework_lower:
-        return "npm run build"
-    elif "vue" in framework_lower:
-        return "npm run build"
-    elif "angular" in framework_lower:
-        return "ng build"
-    else:
-        return "npm run build"
-
-
-def _get_output_directory(framework: str) -> str:
-    """Get appropriate output directory for framework."""
-    framework_lower = framework.lower()
-    
-    if "next" in framework_lower:
-        return ".next"
-    elif "nuxt" in framework_lower:
-        return ".output/public"
-    elif "svelte" in framework_lower:
-        return "build"
-    elif "react" in framework_lower or "cra" in framework_lower:
-        return "dist"  # Vite uses dist by default
-    elif "vite" in framework_lower:
-        return "dist"
-    elif "vue" in framework_lower:
-        return "dist"
-    elif "angular" in framework_lower:
-        return "dist/browser"
-    else:
-        return "dist"
+        payload = response.json()
+        state = str(payload.get("readyState") or payload.get("status") or "").upper()
+        if state == "READY":
+            return payload
+        if state in {"ERROR", "CANCELED", "CANCELLED"}:
+            detail = payload.get("errorMessage") or payload.get("error") or state
+            raise VercelDeployError(f"Vercel build failed: {detail}")
+        await asyncio.sleep(4)
+    raise VercelDeployError("Timed out waiting for Vercel to finish building")

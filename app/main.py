@@ -14,6 +14,9 @@ from .routes import jobs as jobs_router
 from .routes import detection as detection_router
 from .routes import deployments as deployments_router
 from .routes import ws as ws_router
+from .routes import oauth as oauth_router
+from .routes import env_vars as env_vars_router
+from .routes import auth as auth_router
 
 app = FastAPI(
     title="AI DevOps Engineer Backend",
@@ -35,17 +38,19 @@ app.include_router(jobs_router.router)
 app.include_router(detection_router.router)
 app.include_router(deployments_router.router)
 app.include_router(ws_router.router)
+app.include_router(oauth_router.router)
+app.include_router(env_vars_router.router)
+app.include_router(auth_router.router)
 
 
 @app.get("/health")
 async def health() -> dict:
     """Liveness probe plus optional deployment capability flags (no secrets)."""
-    from .config import settings, vercel_configured, render_configured
+    from .config import settings, supabase_configured
 
     return {
         "status": "ok",
         "version": "0.3.0",
-        "vercel": "configured" if vercel_configured() else "not_configured",
-        "render": "configured" if render_configured() else "not_configured",
-        "deployment_mode": "configuration_only",  # For hackathon: creates configs, requires manual GitHub linking
+        "supabase": "configured" if supabase_configured() else "not_configured",
+        "deployment_mode": "live",
     }

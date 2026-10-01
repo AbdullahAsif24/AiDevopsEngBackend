@@ -38,14 +38,16 @@ async def ws_jobs(websocket: WebSocket) -> None:
                 event = None
 
             if event is not None and (filtered_job_id is None or event.job_id == filtered_job_id):
-                await websocket.send_json(event.model_dump())
+                await websocket.send_json(event.model_dump(mode="json"))
 
             # Opportunistically accept a filter message if the client sent one.
             try:
                 msg = await asyncio.wait_for(websocket.receive_text(), timeout=0.05)
                 filtered_job_id = msg.strip() or None
-            except Exception:
-                pass  # no message right now; keep streaming
+            except asyncio.TimeoutError:
+                pass
+            except WebSocketDisconnect:
+                raise
 
     except WebSocketDisconnect:
         pass

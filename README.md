@@ -2,7 +2,7 @@
 
 An asynchronous, AI-powered backend service that takes any public **GitHub repository URL**, intelligently inspects the repository architecture, and automatically generates an optimized, production-ready **Dockerfile**. 
 
-The system features an autonomous **self-healing retry loop** powered by Groq LLM inference (`llama-3.3-70b-versatile`), live WebSocket progress streaming, and strict contract validation using Pydantic.
+The system features an autonomous **self-healing retry loop** powered by Groq LLM inference (`openai/gpt-oss-120b`), live WebSocket progress streaming, and strict contract validation using Pydantic.
 
 ---
 
@@ -63,7 +63,7 @@ The backend operates as an asynchronous pipeline with background job execution t
                                          ▼
                             ┌─────────────────────────┐
                             │    Groq Cloud API       │
-                            │ (llama-3.3-70b-versatile│
+                            │ (openai/gpt-oss-120b)   │
                             └─────────────────────────┘
 ```
 
@@ -74,7 +74,7 @@ The backend operates as an asynchronous pipeline with background job execution t
 - **Framework**: [FastAPI](https://fastapi.tiangolo.com/) (Async Python 3.10+)
 - **ASGI Server**: [Uvicorn](https://www.uvicorn.org/) (Standard with WebSockets & uvloop support)
 - **Data Validation**: [Pydantic v2](https://docs.pydantic.dev/latest/)
-- **LLM Provider**: [Groq SDK](https://github.com/groq/groq-python) (`llama-3.3-70b-versatile` JSON mode)
+- **LLM Provider**: [Groq SDK](https://github.com/groq/groq-python) (`openai/gpt-oss-120b` JSON mode)
 - **Git Operations**: [GitPython](https://gitpython.readthedocs.io/) (Shallow clones & temp directory lifecycle)
 - **Configuration**: [python-dotenv](https://github.com/theskumar/python-dotenv) & [pydantic-settings](https://docs.pydantic.dev/latest/concepts/pydantic_settings/)
 
@@ -160,7 +160,7 @@ Configure the following variables in `.env`:
 | Variable | Type | Required | Default | Description |
 | :--- | :--- | :--- | :--- | :--- |
 | `GROQ_API_KEY` | `string` | **Yes** | `""` | Your Groq API key from Groq Console. |
-| `GROQ_MODEL` | `string` | No | `llama-3.3-70b-versatile` | Groq model used for generation and healing. |
+| `GROQ_MODEL` | `string` | No | `openai/gpt-oss-120b` | Groq model used for generation and healing. |
 | `GROQ_TEMPERATURE`| `float` | No | `0.1` | Temperature (low value ensures strict template adherence). |
 | `MAX_HEAL_RETRIES`| `integer`| No | `3` | Maximum self-healing attempts on build failures. |
 
@@ -601,7 +601,7 @@ Every job undergoes a strictly defined state progression:
 | `queued` | Request received and scheduled onto the background event loop. |
 | `cloning` | Executing `git clone --depth 1` into a temporary filesystem path. |
 | `analyzing` | Filtering junk files (`node_modules`, `.venv`), parsing `package.json`/`requirements.txt`, and detecting the entry point. |
-| `generating` | Selecting template skeleton and querying Groq (`llama-3.3-70b-versatile`) for Dockerfile parameters. |
+| `generating` | Selecting template skeleton and querying Groq (`openai/gpt-oss-120b`) for Dockerfile parameters. |
 | `building` | Container build validation step. |
 | `healing` | Build failed; error logs sent back to Groq with patch instructions. |
 | `done` | Generation completed successfully. Full `DockerfileResult` available. |
