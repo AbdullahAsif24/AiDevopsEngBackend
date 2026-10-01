@@ -23,7 +23,9 @@ class CloneError(Exception):
     """Raised when we cannot obtain the repo (not found, uncloneable, etc.)."""
 
 
-async def check_repo_exists(repo_url: str, timeout: float = 10.0) -> None:
+async def check_repo_exists(
+    repo_url: str, timeout: float = 10.0, github_token: Optional[str] = None
+) -> None:
     """Optionally hit the GitHub API to confirm the repo exists and isn't huge.
 
     Running before a clone is a cheap gate: we avoid cloning something that
@@ -32,12 +34,21 @@ async def check_repo_exists(repo_url: str, timeout: float = 10.0) -> None:
 
     We only *warn* on missing info (e.g. rate-limited) rather than hard-failing,
     because the API is a best-effort check. A 404 is a hard failure though.
+
+    Args:
+        repo_url: The GitHub repository URL
+        timeout: Request timeout in seconds
+        github_token: Optional GitHub token for private repository access
     """
     import httpx
 
     url = github_api_url(repo_url)
+    headers = {}
+    if github_token:
+        headers["Authorization"] = f"token {github_token}"
+
     async with httpx.AsyncClient(timeout=timeout) as client:
-        resp = await client.get(url)
+        resp = await client.get(url, headers=headers)
 
     if resp.status_code == 404:
         raise CloneError(f"Repo not found on GitHub: {repo_url}")
@@ -103,12 +114,19 @@ class RepoSnapshot:
         await self.cleanup()
 
 
-async def clone_repo(repo_url: str, check_github: bool = True) -> RepoSnapshot:
+async def clone_repo(
+    repo_url: str, check_github: bool = True, github_token: Optional[str] = None
+) -> RepoSnapshot:
     """Shallow-clone a GitHub repo into a fresh temp dir.
 
     1. Validate the URL / normalize it.
     2. Optionally hit the GitHub API (existence/size gate).
     3. Create a unique temp dir and shallow (depth=1) clone into it.
+
+    Args:
+        repo_url: The GitHub repository URL
+        check_github: Whether to check repo existence via GitHub API
+        github_token: Optional GitHub token for private repository access
 
     Returns a RepoSnapshot context manager. Raises CloneError / InvalidRepoURL.
     """
@@ -119,7 +137,7 @@ async def clone_repo(repo_url: str, check_github: bool = True) -> RepoSnapshot:
         raise InvalidRepoURL(str(exc)) from exc
 
     if check_github:
-        await check_repo_exists(repo_url)
+        await check_repo_exists(repo_url, github_token=github_token)
 
     # One mkdtemp per job — jobs never share a directory.
     workdir = tempfile.mkdtemp(prefix="aidevops_")
@@ -127,7 +145,15 @@ async def clone_repo(repo_url: str, check_github: bool = True) -> RepoSnapshot:
     def _do_clone():
         try:
             # depth=1 => shallow clone (no history) — plenty for analysis, fast.
-            Repo.clone_from(clone_url, workdir, depth=1)
+            # If token provided, inject it into the clone URL for authentication
+            if github_token:
+                # Inject token into URL: https://TOKEN@github.com/owner/repo.git
+                auth_clone_url = clone_url.replace(
+                    "https://github.com/", f"https://{github_token}@github.com/"
+                )
+                Repo.clone_from(auth_clone_url, workdir, depth=1)
+            else:
+                Repo.clone_from(clone_url, workdir, depth=1)
         except GitCommandError as exc:
             raise CloneError(f"Clone failed: {exc}") from exc
 
