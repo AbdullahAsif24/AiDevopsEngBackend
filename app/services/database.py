@@ -1,28 +1,39 @@
-"""Database service for Supabase operations."""
+"""Database service — Supabase when configured, else in-memory fallback."""
 from __future__ import annotations
 
 import json
 from datetime import datetime, timezone
 from typing import Any, Optional
 
-from supabase import Client, create_client
-
 from ..config import settings, supabase_configured
 from ..contracts import JobDetection, JobEvent, JobStage
 
 
+class _MemoryStore:
+    """Process-local store used when Supabase is not configured."""
+
+    def __init__(self) -> None:
+        self.credentials: dict[tuple[str, str], dict[str, Any]] = {}
+        self.jobs: dict[str, dict[str, Any]] = {}
+        self.env_vars: dict[str, dict[str, str]] = {}
+
+
+_memory = _MemoryStore()
+
+
 class DatabaseService:
-    """Service for all Supabase database operations."""
+    """Service for credential / job persistence."""
 
     def __init__(self):
-        """Initialize Supabase client."""
-        if not supabase_configured():
-            raise RuntimeError("Supabase not configured")
-        self.client: Client = create_client(
-            settings.supabase_url, settings.supabase_service_role_key
-        )
+        self._use_memory = not supabase_configured()
+        self.client = None
+        if not self._use_memory:
+            from supabase import create_client
 
-    # User credentials operations
+            self.client = create_client(
+                settings.supabase_url, settings.supabase_service_role_key
+            )
+
     async def store_user_credential(
         self,
         user_id: str,
@@ -31,7 +42,6 @@ class DatabaseService:
         refresh_token: Optional[str] = None,
         token_expires_at: Optional[datetime] = None,
     ) -> None:
-        """Store or update user's OAuth credentials for a platform."""
         data = {
             "user_id": user_id,
             "platform": platform,
@@ -39,8 +49,9 @@ class DatabaseService:
             "refresh_token": refresh_token,
             "token_expires_at": token_expires_at.isoformat() if token_expires_at else None,
         }
-
-        # Upsert using on_conflict
+        if self._use_memory:
+            _memory.credentials[(user_id, platform)] = data
+            return
         try:
             self.client.table("user_credentials").upsert(data).execute()
         except Exception as e:
@@ -48,7 +59,8 @@ class DatabaseService:
             raise
 
     async def get_user_credential(self, user_id: str, platform: str) -> Optional[dict]:
-        """Get user's OAuth credentials for a platform."""
+        if self._use_memory:
+            return _memory.credentials.get((user_id, platform))
         try:
             result = (
                 self.client.table("user_credentials")
@@ -65,12 +77,13 @@ class DatabaseService:
         return None
 
     async def delete_user_credential(self, user_id: str, platform: str) -> None:
-        """Delete user's OAuth credentials for a platform."""
+        if self._use_memory:
+            _memory.credentials.pop((user_id, platform), None)
+            return
         self.client.table("user_credentials").delete().eq("user_id", user_id).eq(
             "platform", platform
         ).execute()
 
-    # Job operations
     async def create_job(
         self,
         user_id: str,
@@ -78,29 +91,30 @@ class DatabaseService:
         repo_url: str,
         status: str = "queued",
     ) -> dict:
-        """Create a new job record in the database."""
         data = {
             "user_id": user_id,
             "job_id": job_id,
             "status": status,
             "repo_url": repo_url,
             "logs": [],
+            "id": job_id,
+            "created_at": datetime.now(timezone.utc).isoformat(),
         }
-
+        if self._use_memory:
+            _memory.jobs[job_id] = data
+            return data
         try:
             result = self.client.table("jobs").insert(data).select().execute()
             if result.data and len(result.data) > 0:
                 return result.data[0]
-            else:
-                # Fallback: return the original data if insert succeeded but no return data
-                return data
+            return data
         except Exception as e:
-            # If insert fails, try to get more detailed error info
             print(f"Database insert error: {e}")
             raise
 
     async def get_job(self, job_id: str) -> Optional[dict]:
-        """Get a job by job_id."""
+        if self._use_memory:
+            return _memory.jobs.get(job_id)
         try:
             result = (
                 self.client.table("jobs").select("*").eq("job_id", job_id).limit(1).execute()
@@ -112,7 +126,11 @@ class DatabaseService:
         return None
 
     async def update_job(self, job_id: str, updates: dict[str, Any]) -> None:
-        """Update a job record."""
+        if self._use_memory:
+            job = _memory.jobs.get(job_id)
+            if job:
+                job.update(updates)
+            return
         try:
             self.client.table("jobs").update(updates).eq("job_id", job_id).execute()
         except Exception as e:
@@ -120,7 +138,10 @@ class DatabaseService:
             raise
 
     async def list_user_jobs(self, user_id: str) -> list[dict]:
-        """List all jobs for a user, most recent first."""
+        if self._use_memory:
+            jobs = [j for j in _memory.jobs.values() if j.get("user_id") == user_id]
+            jobs.sort(key=lambda j: j.get("created_at") or "", reverse=True)
+            return jobs
         try:
             result = (
                 self.client.table("jobs")
@@ -135,18 +156,14 @@ class DatabaseService:
             return []
 
     async def add_job_log(self, job_id: str, event: JobEvent) -> None:
-        """Add a log event to a job."""
         job = await self.get_job(job_id)
         if not job:
             return
-
-        # Handle both JSON string and direct list cases
         logs_data = job.get("logs", [])
         if isinstance(logs_data, str):
             logs = json.loads(logs_data)
         else:
             logs = logs_data if logs_data else []
-
         logs.append(
             {
                 "job_id": event.job_id,
@@ -155,7 +172,6 @@ class DatabaseService:
                 "timestamp": event.timestamp.isoformat(),
             }
         )
-
         await self.update_job(
             job_id,
             {
@@ -166,7 +182,6 @@ class DatabaseService:
         )
 
     async def update_job_detection(self, job_id: str, detection: JobDetection) -> None:
-        """Update job detection information."""
         await self.update_job(
             job_id,
             {
@@ -176,7 +191,6 @@ class DatabaseService:
         )
 
     async def update_job_deployment(self, job_id: str, deployment: dict) -> None:
-        """Update job deployment information."""
         await self.update_job(
             job_id,
             {
@@ -186,7 +200,6 @@ class DatabaseService:
         )
 
     async def update_job_result(self, job_id: str, result: dict) -> None:
-        """Update job result (Dockerfile generation result)."""
         await self.update_job(
             job_id,
             {
@@ -196,7 +209,6 @@ class DatabaseService:
         )
 
     async def update_job_error(self, job_id: str, error: str) -> None:
-        """Update job error information."""
         await self.update_job(
             job_id,
             {
@@ -207,7 +219,6 @@ class DatabaseService:
         )
 
     async def update_job_status(self, job_id: str, status: str) -> None:
-        """Update job status."""
         await self.update_job(
             job_id,
             {
@@ -217,7 +228,6 @@ class DatabaseService:
         )
 
     async def update_job_repo_path(self, job_id: str, repo_path: str) -> None:
-        """Update job repository path."""
         await self.update_job(
             job_id,
             {
@@ -226,49 +236,40 @@ class DatabaseService:
             },
         )
 
-    # Environment variable operations
     async def store_env_vars(self, job_id: str, env_vars: dict[str, str]) -> None:
-        """Store environment variables for a job."""
-        # First, get the database job ID from the job_id string
+        if self._use_memory:
+            _memory.env_vars[job_id] = dict(env_vars)
+            return
         job = await self.get_job(job_id)
         if not job:
             raise ValueError(f"Job {job_id} not found")
-
         db_job_id = job["id"]
-
-        # Delete existing env vars for this job
         self.client.table("environment_variables").delete().eq("job_id", db_job_id).execute()
-
-        # Insert new env vars
         for key, value in env_vars.items():
             self.client.table("environment_variables").insert(
                 {"job_id": db_job_id, "key": key, "value": value}
             ).execute()
 
     async def get_env_vars(self, job_id: str) -> dict[str, str]:
-        """Get environment variables for a job."""
+        if self._use_memory:
+            return dict(_memory.env_vars.get(job_id) or {})
         job = await self.get_job(job_id)
         if not job:
             return {}
-
         db_job_id = job["id"]
-
         result = (
             self.client.table("environment_variables")
             .select("key, value")
             .eq("job_id", db_job_id)
             .execute()
         )
-
         return {item["key"]: item["value"] for item in result.data}
 
 
-# Global database service instance
 _db_service: Optional[DatabaseService] = None
 
 
 def get_db_service() -> DatabaseService:
-    """Get or create the global database service instance."""
     global _db_service
     if _db_service is None:
         _db_service = DatabaseService()
