@@ -14,7 +14,8 @@ load_dotenv()
 print(f"Config loaded - Vercel Client ID: {os.getenv('VERCEL_CLIENT_ID', 'None')[:10] if os.getenv('VERCEL_CLIENT_ID') else 'None'}...")
 print(f"Supabase URL: {os.getenv('SUPABASE_URL', 'None')[:20] if os.getenv('SUPABASE_URL') else 'None'}...")
 print(f"Vercel API Token: {os.getenv('VERCEL_API_TOKEN', 'None')[:10] if os.getenv('VERCEL_API_TOKEN') else 'None'}...")
-print(f"Render API Token: {os.getenv('RENDER_API_TOKEN', 'None')[:10] if os.getenv('RENDER_API_TOKEN') else 'None'}...")
+_render_tok = os.getenv("RENDER_API_TOKEN") or os.getenv("RENDER_API_KEY") or ""
+print(f"Render API Token: {_render_tok[:10] if _render_tok else 'None'}...")
 
 
 class Settings:
@@ -37,12 +38,22 @@ class Settings:
 
     # Supabase configuration for authentication and database
     supabase_url: str = os.getenv("SUPABASE_URL", "")
-    supabase_service_role_key: str = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
+    supabase_service_role_key: str = (
+        os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
+        or os.getenv("SUPABASE_SERVICE_KEY", "")
+    )
 
-    # OAuth callback URLs
-    vercel_oauth_callback_url: str = os.getenv("VERCEL_OAUTH_CALLBACK_URL", "")
-    render_oauth_callback_url: str = os.getenv("RENDER_OAUTH_CALLBACK_URL", "")
-    railway_oauth_callback_url: str = os.getenv("RAILWAY_OAUTH_CALLBACK_URL", "")
+    # OAuth callback URLs (defaults for local hackathon)
+    vercel_oauth_callback_url: str = os.getenv(
+        "VERCEL_OAUTH_CALLBACK_URL", "http://127.0.0.1:8000/oauth/vercel/callback"
+    )
+    render_oauth_callback_url: str = os.getenv(
+        "RENDER_OAUTH_CALLBACK_URL", "http://127.0.0.1:8000/oauth/render/callback"
+    )
+    railway_oauth_callback_url: str = os.getenv(
+        "RAILWAY_OAUTH_CALLBACK_URL", "http://127.0.0.1:8000/oauth/railway/callback"
+    )
+    frontend_url: str = os.getenv("FRONTEND_URL", "http://127.0.0.1:5173")
 
     # OAuth configuration
     vercel_client_id: str = os.getenv("VERCEL_CLIENT_ID", "")
@@ -52,9 +63,11 @@ class Settings:
     railway_client_id: str = os.getenv("RAILWAY_CLIENT_ID", "")
     railway_client_secret: str = os.getenv("RAILWAY_CLIENT_SECRET", "")
 
-    # Account-level API tokens (fallback for deployments)
+    # Account-level API tokens (fallback for deployments / "connect" without OAuth app)
     vercel_api_token: str = os.getenv("VERCEL_API_TOKEN", "")
-    render_api_token: str = os.getenv("RENDER_API_TOKEN", "")
+    render_api_token: str = (
+        os.getenv("RENDER_API_TOKEN", "") or os.getenv("RENDER_API_KEY", "")
+    )
     render_owner_id: str = os.getenv("RENDER_OWNER_ID", "")
     vercel_team_id: str = os.getenv("VERCEL_TEAM_ID", "")
 

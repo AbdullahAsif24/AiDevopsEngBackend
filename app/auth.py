@@ -63,18 +63,18 @@ async def verify_supabase_token(
     return user_id
 
 
-async def get_user_id(user_id: str = Depends(verify_supabase_token)) -> str:
-    """Dependency that returns the user_id from the verified token.
-
-    This is a convenience wrapper around verify_supabase_token for use in route handlers.
-
-    Args:
-        user_id: The user_id from verify_supabase_token
-
-    Returns:
-        The user_id (UUID) as a string
-    """
-    return user_id
+async def get_user_id(
+    credentials: HTTPAuthorizationCredentials | None = Depends(HTTPBearer(auto_error=False)),
+) -> str:
+    """Return authenticated user_id, or a local guest id when auth is unavailable."""
+    if credentials is not None:
+        try:
+            return await verify_supabase_token(credentials)
+        except HTTPException:
+            if supabase_configured():
+                raise
+    # Hackathon / local: allow platform connect without Supabase auth.
+    return "local-user"
 
 
 async def optional_auth(

@@ -46,6 +46,45 @@ from .github_auth import get_user_github_token
 from ..config import settings
 
 
+async def _resolve_platform_token(
+    user_id: str,
+    platform: str,
+    *,
+    account_token: str = "",
+) -> tuple[str | None, str]:
+    """Resolve deploy token: user OAuth/DB credential, then account .env token.
+
+    Returns (token, source_label).
+    """
+    db = get_db_service()
+
+    oauth_getters = {
+        "vercel": get_vercel_oauth,
+        "render": get_render_oauth,
+        "railway": get_railway_oauth,
+    }
+    getter = oauth_getters.get(platform)
+    if getter:
+        oauth = getter()
+        if oauth:
+            try:
+                token = await oauth.get_user_token(user_id)
+                if token:
+                    return token, "user_oauth"
+            except Exception:
+                pass
+
+    # Personal API token saved via POST /oauth/credentials/token (no OAuth app).
+    cred = await db.get_user_credential(user_id, platform)
+    if cred and cred.get("access_token"):
+        return cred["access_token"], "user_token"
+
+    if account_token:
+        return account_token, "account_token"
+
+    return None, "none"
+
+
 class JobNotFound(Exception):
     """Raised when GET /jobs/{id} references an unknown id."""
 
@@ -222,24 +261,19 @@ async def _run_job(job_id: str, user_id: str) -> None:
 
                 await _log(job_id, JobStage.DEPLOYING, "Deploying to Render")
                 try:
-                    # Try to get user's Render token first
-                    render_token = None
-                    render_oauth = get_render_oauth()
-
-                    if render_oauth:
-                        try:
-                            render_token = await render_oauth.get_user_token(user_id)
-                            await _log(job_id, JobStage.DEPLOYING, "Using user's Render account")
-                        except Exception as e:
-                            await _log(job_id, JobStage.DEPLOYING, f"User Render token not available: {str(e)}")
-
-                    # Fallback to account-level token if user token not available
-                    if not render_token and settings.render_api_token:
-                        render_token = settings.render_api_token
-                        await _log(job_id, JobStage.DEPLOYING, "Using account-level Render token")
-
+                    render_token, token_src = await _resolve_platform_token(
+                        user_id, "render", account_token=settings.render_api_token
+                    )
+                    if render_token:
+                        await _log(
+                            job_id,
+                            JobStage.DEPLOYING,
+                            f"Using Render credentials ({token_src})",
+                        )
                     if not render_token:
-                        raise RenderDeployError("No Render token available - please connect your account or configure account-level token")
+                        raise RenderDeployError(
+                            "No Render token available — connect Render in the UI or set RENDER_API_KEY"
+                        )
 
                     # Get user's environment variables
                     from .env_vars import get_env_var_manager
@@ -321,29 +355,20 @@ async def _run_job(job_id: str, user_id: str) -> None:
                 # Static / Vercel-native path: no Dockerfile, deploy straight to Vercel.
                 await _log(job_id, JobStage.DEPLOYING, f"Deploying {detection.detected_framework} to Vercel")
                 try:
-                    # Try to get user's Vercel token first
-                    vercel_token = None
-                    vercel_oauth = get_vercel_oauth()
-                    
                     await _log(job_id, JobStage.DEPLOYING, f"User ID: {user_id}")
-                    await _log(job_id, JobStage.DEPLOYING, f"Vercel OAuth available: {vercel_oauth is not None}")
-                    await _log(job_id, JobStage.DEPLOYING, f"Account Vercel token configured: {bool(settings.vercel_api_token)}")
-                    
-                    if vercel_oauth:
-                        try:
-                            vercel_token = await vercel_oauth.get_user_token(user_id)
-                            await _log(job_id, JobStage.DEPLOYING, "Using user's Vercel account")
-                        except Exception as e:
-                            await _log(job_id, JobStage.DEPLOYING, f"User Vercel token not available: {str(e)}")
-                    
-                    # Fallback to account-level token if user token not available
-                    if not vercel_token and settings.vercel_api_token:
-                        vercel_token = settings.vercel_api_token
-                        await _log(job_id, JobStage.DEPLOYING, f"Using account-level Vercel token: {vercel_token[:10]}...")
-                    
+                    vercel_token, token_src = await _resolve_platform_token(
+                        user_id, "vercel", account_token=settings.vercel_api_token
+                    )
+                    if vercel_token:
+                        await _log(
+                            job_id,
+                            JobStage.DEPLOYING,
+                            f"Using Vercel credentials ({token_src})",
+                        )
                     if not vercel_token:
-                        await _log(job_id, JobStage.DEPLOYING, f"No Vercel token available. Account token configured: {bool(settings.vercel_api_token)}")
-                        raise VercelDeployError("No Vercel token available - please connect your account or configure account-level token")
+                        raise VercelDeployError(
+                            "No Vercel token available — connect Vercel in the UI or set VERCEL_API_TOKEN"
+                        )
 
                     # Get user's environment variables
                     from .env_vars import get_env_var_manager
