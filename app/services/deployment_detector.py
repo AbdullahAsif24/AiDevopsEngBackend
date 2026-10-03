@@ -121,6 +121,8 @@ def _contains_str(content: str, *needles: str) -> bool:
 # ---------------------------------------------------------------------------
 
 _PORT_NODE = re.compile(r"\.listen\(\s*(\d+)")
+# Also match: process.env.PORT || 3000  or  process.env.PORT ?? 3000
+_PORT_NODE_ENV = re.compile(r"process\.env\.PORT\s*(?:\|\||\?\?)\s*(\d+)")
 _PORT_FLASK = re.compile(r"app\.run\(.*?port\s*=\s*(\d+)", re.IGNORECASE)
 _PORT_SPRING_INLINE = re.compile(r"server\.port\s*=\s*(\d+)")
 _PORT_YML = re.compile(r"port:\s*(\d+)")
@@ -141,7 +143,10 @@ def _detect_port(repo_root: str, entry_point: Optional[str], framework: str) -> 
             elif "spring" in framework.lower():
                 m = _PORT_SPRING_INLINE.search(content)
             else:
+                # Try explicit .listen(PORT) first, then process.env.PORT fallback.
                 m = _PORT_NODE.search(content)
+                if not m:
+                    m = _PORT_NODE_ENV.search(content)
             if m:
                 try:
                     return int(m.group(1))
@@ -376,13 +381,46 @@ def detect_by_rules(repo_path: str) -> Optional[DetectionResult]:
                 return DetectionResult(
                     deployment_type=DeploymentType.CONTAINER,
                     confidence="high",
-                    detected_framework="Node.js",
+                    detected_framework="Node.js (Express/Fastify/Koa/Nest)",
                     entry_point=entry_point,
                     listen_port=port,
                     reasoning="Node backend framework present (express/fastify/koa/nest) with no Vercel adapter.",
                     needs_dockerfile=True,
                     detection_method="rule_based",
                 )
+
+    # i2) Plain Node.js HTTP server — no named framework but has a start script
+    #     that runs a .js file directly, AND the entry point uses createServer or
+    #     .listen(). Catches repos like johnpapa/node-hello.
+    if pkg is not None:
+        entry_point = _detect_entry_point(repo_root, pkg)
+        # Check start script for direct node execution (e.g. "node index.js")
+        scripts = pkg.get("scripts", {})
+        start_script = scripts.get("start", "") if isinstance(scripts, dict) else ""
+        starts_with_node = bool(
+            re.search(r"\bnode\s+[\w./]+\.(?:js|mjs|cjs)", start_script)
+        )
+        # Read entry point to look for HTTP server signals.
+        ep_content = _read_file(repo_root, entry_point) if entry_point else None
+        is_http_server = ep_content is not None and (
+            _contains_str(ep_content, "createServer", ".listen(", "require('http')",
+                          'require("http")', "require('https')", 'require("https")')
+        )
+        if starts_with_node or is_http_server:
+            port = _detect_port(repo_root, entry_point, "node")
+            return DetectionResult(
+                deployment_type=DeploymentType.CONTAINER,
+                confidence="medium",
+                detected_framework="Node.js (plain HTTP)",
+                entry_point=entry_point,
+                listen_port=port,
+                reasoning=(
+                    "package.json start script runs node directly or entry point "
+                    "uses http.createServer/.listen — plain Node.js server."
+                ),
+                needs_dockerfile=True,
+                detection_method="rule_based",
+            )
 
     # j) No confident match -> fall through to LLM.
     return None

@@ -57,19 +57,28 @@ Do NOT write Dockerfile syntax from scratch — only fill placeholders.
 {template_skeletons}
 
 ## GUIDANCE
-- Detect the stack: Node/Express if package.json lists 'express' OR the file
-  tree/entry point is a .js server. Python if requirements.txt / pyproject.toml
-  exists and entry point is a .py app. Otherwise static (HTML/CSS/JS or dist/).
+- **Node/Express/plain-HTTP**: Use the `node` template when package.json exists
+  and the entry point is a .js file. This includes plain `http.createServer` apps
+  with NO framework — they are still Node containers, NOT static sites.
+  - Set `$START_COMMAND` from the package.json `start` script (e.g. `node index.js`)
+    or `main` field. Default: `node index.js`.
+  - For `$PORT`: scan the entry file for `.listen(PORT)` or
+    `process.env.PORT || <number>` / `process.env.PORT ?? <number>`.
+    Default to **3000** for Node if no explicit port is found.
+- **Python**: Use the `python` template when requirements.txt or pyproject.toml
+  exists and the entry is a .py file. Default port 8000.
+- **Static**: Use the `static` template ONLY for repos that have NO server entry
+  point at all — pure HTML/CSS/JS in a dist/ or public/ folder, or a build output.
+  Do NOT classify a Node.js server repo as static.
 - Java / compiled languages are OUT OF SCOPE. If the repo doesn't clearly map to
   one of the three templates, choose the closest and note it in metadata.
 - Pick the correct template, then substitute:
-  * $FRAMEWORK_NOTE  -> short human description, e.g. "Express for Node", or
-                        "FastAPI (Python)".
-  * $PORT            -> the actual port from the fingerpint's entry point or
-                        manifest scripts (default 3000 for node, 8000 for python).
-  * $START_COMMAND   -> how to launch, e.g. "node server.js", or
-                        "uvicorn main:app --host 0.0.0.0 --port $PORT".
-  * $STATIC_SOURCE   -> for static: the directory to copy, usually 'dist' or '.'.
+  * $FRAMEWORK_NOTE  -> short human description, e.g. "plain Node.js HTTP", or
+                        "Express for Node", or "FastAPI (Python)".
+  * $PORT            -> the actual port number (integer, no quotes).
+  * $START_COMMAND   -> how to launch, e.g. "node index.js", or
+                        "uvicorn main:app --host 0.0.0.0 --port 8000".
+  * $STATIC_SOURCE   -> for static only: the directory to copy, usually 'dist' or '.'.
 - In the returned JSON: `dockerfile_content` must be the COMPLETE Dockerfile
   (all lines, fully filled). `framework` = 'node' | 'python' | 'static'.
 - If an existing Dockerfile/docker-compose was provided in the fingerprint, prefer

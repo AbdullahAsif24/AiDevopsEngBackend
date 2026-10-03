@@ -26,18 +26,19 @@ FROM node:20-alpine
 # Set the working directory inside the container.
 WORKDIR /app
 
-# Install dependencies FIRST (layer-cache friendly: code changes don't
-# re-trigger npm install as long as package*.json are unchanged).
+# Install dependencies FIRST (layer-cache friendly).
+# Copies package-lock.json if it exists for reproducible installs.
 COPY package*.json ./
-RUN npm install --production
+RUN npm install --omit=dev
 
 # Copy the rest of the application source.
 COPY . .
 
-# The port the app listens on (filled from the fingerprint).
+# The port the app listens on.
+# Most Node apps use process.env.PORT at runtime; expose the default.
 EXPOSE $PORT
 
-# Shell-form launch command, e.g.  node server.js
+# Shell-form launch command, e.g.  node index.js
 CMD $START_COMMAND
 """
 )

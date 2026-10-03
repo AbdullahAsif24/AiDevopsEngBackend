@@ -46,45 +46,6 @@ from .github_auth import get_user_github_token
 from ..config import settings
 
 
-async def _resolve_platform_token(
-    user_id: str,
-    platform: str,
-    *,
-    account_token: str = "",
-) -> tuple[str | None, str]:
-    """Resolve deploy token: user OAuth/DB credential, then account .env token.
-
-    Returns (token, source_label).
-    """
-    db = get_db_service()
-
-    oauth_getters = {
-        "vercel": get_vercel_oauth,
-        "render": get_render_oauth,
-        "railway": get_railway_oauth,
-    }
-    getter = oauth_getters.get(platform)
-    if getter:
-        oauth = getter()
-        if oauth:
-            try:
-                token = await oauth.get_user_token(user_id)
-                if token:
-                    return token, "user_oauth"
-            except Exception:
-                pass
-
-    # Personal API token saved via POST /oauth/credentials/token (no OAuth app).
-    cred = await db.get_user_credential(user_id, platform)
-    if cred and cred.get("access_token"):
-        return cred["access_token"], "user_token"
-
-    if account_token:
-        return account_token, "account_token"
-
-    return None, "none"
-
-
 class JobNotFound(Exception):
     """Raised when GET /jobs/{id} references an unknown id."""
 
@@ -232,48 +193,37 @@ async def _run_job(job_id: str, user_id: str) -> None:
                     return
 
                 await db.update_job_result(job_id, result.model_dump())
+                # Write Dockerfile to local snapshot (for logging/UI display).
                 dockerfile_path = os.path.join(snapshot.root, "Dockerfile")
                 if not os.path.exists(dockerfile_path):
                     with open(dockerfile_path, "w", encoding="utf-8") as handle:
                         handle.write(result.dockerfile_content)
-
-                # Commit Dockerfile to GitHub for Render deployment
-                await _log(job_id, JobStage.DEPLOYING, "Committing Dockerfile to GitHub repository")
-                try:
-                    github_token = await get_user_github_token(user_id)
-                    if github_token:
-                        await _commit_dockerfile_to_github(
-                            snapshot.root, job.repo_url, github_token, job_id
-                        )
-                        await _log(job_id, JobStage.DEPLOYING, "Dockerfile committed to GitHub")
-                    else:
-                        await _log(
-                            job_id,
-                            JobStage.DEPLOYING,
-                            "No GitHub token available - Dockerfile not committed to repo. Render deployment may fail.",
-                        )
-                except Exception as e:
-                    await _log(
-                        job_id,
-                        JobStage.DEPLOYING,
-                        f"Failed to commit Dockerfile to GitHub: {str(e)}. Render deployment may fail.",
-                    )
+                await _log(
+                    job_id,
+                    JobStage.GENERATING,
+                    "Dockerfile generated successfully (deploying via native buildpack — no GitHub commit needed)",
+                )
 
                 await _log(job_id, JobStage.DEPLOYING, "Deploying to Render")
                 try:
-                    render_token, token_src = await _resolve_platform_token(
-                        user_id, "render", account_token=settings.render_api_token
-                    )
-                    if render_token:
-                        await _log(
-                            job_id,
-                            JobStage.DEPLOYING,
-                            f"Using Render credentials ({token_src})",
-                        )
+                    # Try to get user's Render token first
+                    render_token = None
+                    render_oauth = get_render_oauth()
+
+                    if render_oauth:
+                        try:
+                            render_token = await render_oauth.get_user_token(user_id)
+                            await _log(job_id, JobStage.DEPLOYING, "Using user's Render account")
+                        except Exception as e:
+                            await _log(job_id, JobStage.DEPLOYING, f"User Render token not available: {str(e)}")
+
+                    # Fallback to account-level token if user token not available
+                    if not render_token and settings.render_api_token:
+                        render_token = settings.render_api_token
+                        await _log(job_id, JobStage.DEPLOYING, "Using account-level Render token")
+
                     if not render_token:
-                        raise RenderDeployError(
-                            "No Render token available — connect Render in the UI or set RENDER_API_KEY"
-                        )
+                        raise RenderDeployError("No Render token available - please connect your account or configure account-level token")
 
                     # Get user's environment variables
                     from .env_vars import get_env_var_manager
@@ -289,6 +239,8 @@ async def _run_job(job_id: str, user_id: str) -> None:
                         access_token=render_token,
                         env_vars=env_vars,
                         repo_url=job.repo_url,
+                        detected_framework=detection.detected_framework,
+                        start_command=result.start_command,
                     )
                     await db.update_job_deployment(job_id, deployment_result.model_dump())
                     await _log(
@@ -303,7 +255,7 @@ async def _run_job(job_id: str, user_id: str) -> None:
                     return
 
             # Try Railway deployment if Render is not available or user prefers Railway
-            elif detection.deployment_type == DeploymentType.BACKEND:
+            elif detection.deployment_type == DeploymentType.CONTAINER:
                 await _log(job_id, JobStage.DEPLOYING, "Deploying to Railway")
                 try:
                     # Try to get user's Railway token
@@ -355,20 +307,29 @@ async def _run_job(job_id: str, user_id: str) -> None:
                 # Static / Vercel-native path: no Dockerfile, deploy straight to Vercel.
                 await _log(job_id, JobStage.DEPLOYING, f"Deploying {detection.detected_framework} to Vercel")
                 try:
+                    # Try to get user's Vercel token first
+                    vercel_token = None
+                    vercel_oauth = get_vercel_oauth()
+                    
                     await _log(job_id, JobStage.DEPLOYING, f"User ID: {user_id}")
-                    vercel_token, token_src = await _resolve_platform_token(
-                        user_id, "vercel", account_token=settings.vercel_api_token
-                    )
-                    if vercel_token:
-                        await _log(
-                            job_id,
-                            JobStage.DEPLOYING,
-                            f"Using Vercel credentials ({token_src})",
-                        )
+                    await _log(job_id, JobStage.DEPLOYING, f"Vercel OAuth available: {vercel_oauth is not None}")
+                    await _log(job_id, JobStage.DEPLOYING, f"Account Vercel token configured: {bool(settings.vercel_api_token)}")
+                    
+                    if vercel_oauth:
+                        try:
+                            vercel_token = await vercel_oauth.get_user_token(user_id)
+                            await _log(job_id, JobStage.DEPLOYING, "Using user's Vercel account")
+                        except Exception as e:
+                            await _log(job_id, JobStage.DEPLOYING, f"User Vercel token not available: {str(e)}")
+                    
+                    # Fallback to account-level token if user token not available
+                    if not vercel_token and settings.vercel_api_token:
+                        vercel_token = settings.vercel_api_token
+                        await _log(job_id, JobStage.DEPLOYING, f"Using account-level Vercel token: {vercel_token[:10]}...")
+                    
                     if not vercel_token:
-                        raise VercelDeployError(
-                            "No Vercel token available — connect Vercel in the UI or set VERCEL_API_TOKEN"
-                        )
+                        await _log(job_id, JobStage.DEPLOYING, f"No Vercel token available. Account token configured: {bool(settings.vercel_api_token)}")
+                        raise VercelDeployError("No Vercel token available - please connect your account or configure account-level token")
 
                     # Get user's environment variables
                     from .env_vars import get_env_var_manager

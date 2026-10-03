@@ -1,236 +1,243 @@
-"""OAuth + personal API-token routes for Vercel / Render / Railway."""
+"""OAuth routes for Vercel and Render authentication."""
 from __future__ import annotations
 
-from datetime import datetime, timezone, timedelta
-
-from fastapi import APIRouter, Depends, HTTPException, Query
-from fastapi.responses import RedirectResponse
-from pydantic import BaseModel, Field
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from pydantic import BaseModel
 
 from ..auth import get_user_id
-from ..config import settings
-from ..services.database import get_db_service
-from ..services.oauth import (
-    get_vercel_oauth,
-    get_render_oauth,
-    get_railway_oauth,
-)
+from ..services.oauth import VercelOAuth, RenderOAuth, RailwayOAuth, get_vercel_oauth, get_render_oauth, get_railway_oauth
 
 router = APIRouter(prefix="/oauth", tags=["oauth"])
 
 
+class OAuthCallbackRequest(BaseModel):
+    """Request body for OAuth callback."""
+
+    code: str
+    state: str | None = None
+
+
 class OAuthUrlResponse(BaseModel):
+    """Response for OAuth authorization URL."""
+
     auth_url: str
     platform: str
 
 
 class OAuthTokenResponse(BaseModel):
+    """Response for successful token exchange."""
+
     platform: str
     access_token: str
     expires_at: str | None = None
 
 
-class SaveTokenRequest(BaseModel):
-    platform: str = Field(..., description="vercel | render | railway")
-    access_token: str = Field(..., min_length=8)
-    user_id: str | None = None
-
-
-class PlatformConfig(BaseModel):
-    oauth_configured: bool
-    account_token_configured: bool
-    connected: bool
-    mode: str  # oauth | account_token | disconnected
-
-
-def _frontend_redirect(platform: str, ok: bool, detail: str = "") -> RedirectResponse:
-    base = (settings.frontend_url or "http://127.0.0.1:5173").rstrip("/")
-    status = "success" if ok else "error"
-    q = f"oauth={platform}&status={status}"
-    if detail:
-        from urllib.parse import quote
-
-        q += f"&detail={quote(detail[:200])}"
-    return RedirectResponse(url=f"{base}/?{q}", status_code=302)
-
-
-@router.get("/config")
-async def oauth_config(user_id: str = Depends(get_user_id)) -> dict[str, PlatformConfig]:
-    """What the UI needs to render Connect buttons."""
-    db = get_db_service()
-
-    async def one(platform: str, oauth_ok: bool, account_ok: bool) -> PlatformConfig:
-        cred = await db.get_user_credential(user_id, platform)
-        connected = cred is not None or account_ok
-        if cred is not None:
-            mode = "oauth" if oauth_ok else "token"
-        elif account_ok:
-            mode = "account_token"
-        else:
-            mode = "disconnected"
-        return PlatformConfig(
-            oauth_configured=oauth_ok,
-            account_token_configured=account_ok,
-            connected=connected,
-            mode=mode,
-        )
-
-    return {
-        "vercel": await one(
-            "vercel",
-            get_vercel_oauth() is not None,
-            bool(settings.vercel_api_token),
-        ),
-        "render": await one(
-            "render",
-            get_render_oauth() is not None,
-            bool(settings.render_api_token),
-        ),
-        "railway": await one(
-            "railway",
-            get_railway_oauth() is not None,
-            False,
-        ),
-    }
-
-
-@router.post("/credentials/token")
-async def save_personal_token(
-    payload: SaveTokenRequest,
-    user_id: str = Depends(get_user_id),
-) -> dict:
-    """Save a personal Vercel/Render API token (no OAuth app required)."""
-    platform = payload.platform.lower().strip()
-    if platform not in ("vercel", "render", "railway"):
-        raise HTTPException(status_code=400, detail="Invalid platform")
-
-    uid = payload.user_id or user_id
-    db = get_db_service()
-    await db.store_user_credential(
-        user_id=uid,
-        platform=platform,
-        access_token=payload.access_token.strip(),
-        refresh_token=None,
-        token_expires_at=datetime.now(timezone.utc) + timedelta(days=365),
-    )
-    return {"ok": True, "platform": platform, "connected": True, "user_id": uid}
-
-
 @router.get("/vercel/authorize")
 async def get_vercel_auth_url(
-    user_id: str = Query("local-user"),
+    user_id: str = Query(..., description="User ID for state parameter"),
 ) -> OAuthUrlResponse:
+    """Get Vercel OAuth authorization URL.
+
+    Users should visit this URL to authorize the application to access their Vercel account.
+    """
     vercel_oauth = get_vercel_oauth()
     if not vercel_oauth:
         raise HTTPException(
-            status_code=503,
-            detail="Vercel OAuth app not configured. Paste a Vercel API token instead (POST /oauth/credentials/token).",
+            status_code=503, detail="Vercel OAuth not configured on server"
         )
-    return OAuthUrlResponse(
-        auth_url=vercel_oauth.get_auth_url(state=user_id), platform="vercel"
-    )
+
+    auth_url = vercel_oauth.get_auth_url(state=user_id)
+    return OAuthUrlResponse(auth_url=auth_url, platform="vercel")
 
 
 @router.get("/vercel/callback")
 async def vercel_callback(
-    code: str = Query(...),
-    state: str = Query(None),
-):
+    code: str = Query(..., description="Authorization code"),
+    state: str = Query(None, description="State parameter"),
+    request: Request = None
+) -> OAuthTokenResponse:
+    """Handle Vercel OAuth callback.
+
+    Exchange the authorization code for an access token and store it in the database.
+    """
     vercel_oauth = get_vercel_oauth()
     if not vercel_oauth:
-        return _frontend_redirect("vercel", False, "OAuth not configured")
+        raise HTTPException(
+            status_code=503, detail="Vercel OAuth not configured on server"
+        )
+
     try:
-        user_id = state if state and state != "undefined" else "local-user"
-        await vercel_oauth.exchange_code_for_token(code=code, user_id=user_id)
-        return _frontend_redirect("vercel", True)
+        # Try to get user_id from state, or use a default for testing
+        user_id = state if state and state != "undefined" else "test_user"
+        print(f"Vercel callback - using user_id: {user_id}")
+        token_data = await vercel_oauth.exchange_code_for_token(
+            code=code, user_id=user_id
+        )
+        
+        # Redirect back to frontend with success
+        return OAuthTokenResponse(
+            platform="vercel",
+            access_token=token_data["access_token"],
+            expires_at=token_data.get("expires_at"),
+        )
     except Exception as e:
-        return _frontend_redirect("vercel", False, str(e))
+        print(f"Vercel OAuth error: {e}")
+        raise HTTPException(status_code=400, detail=f"Vercel OAuth failed: {str(e)}")
 
 
 @router.get("/render/authorize")
 async def get_render_auth_url(
-    user_id: str = Query("local-user"),
+    user_id: str = Query(..., description="User ID for state parameter"),
 ) -> OAuthUrlResponse:
+    """Get Render OAuth authorization URL.
+
+    Users should visit this URL to authorize the application to access their Render account.
+    """
     render_oauth = get_render_oauth()
     if not render_oauth:
         raise HTTPException(
-            status_code=503,
-            detail="Render OAuth app not configured. Paste a Render API key instead (POST /oauth/credentials/token).",
+            status_code=503, detail="Render OAuth not configured on server"
         )
-    return OAuthUrlResponse(
-        auth_url=render_oauth.get_auth_url(state=user_id), platform="render"
-    )
+
+    auth_url = render_oauth.get_auth_url(state=user_id)
+    return OAuthUrlResponse(auth_url=auth_url, platform="render")
 
 
 @router.get("/render/callback")
 async def render_callback(
-    code: str = Query(...),
-    state: str = Query(None),
-):
+    code: str = Query(..., description="Authorization code"),
+    state: str = Query(None, description="State parameter")
+) -> OAuthTokenResponse:
+    """Handle Render OAuth callback.
+
+    Exchange the authorization code for an access token and store it in the database.
+    """
     render_oauth = get_render_oauth()
     if not render_oauth:
-        return _frontend_redirect("render", False, "OAuth not configured")
+        raise HTTPException(
+            status_code=503, detail="Render OAuth not configured on server"
+        )
+
     try:
-        user_id = state if state else "local-user"
-        await render_oauth.exchange_code_for_token(code=code, user_id=user_id)
-        return _frontend_redirect("render", True)
+        # Use state as user_id if provided, otherwise use a default
+        user_id = state if state else "default_user"
+        token_data = await render_oauth.exchange_code_for_token(
+            code=code, user_id=user_id
+        )
+        return OAuthTokenResponse(
+            platform="render",
+            access_token=token_data["access_token"],
+            expires_at=token_data.get("expires_at"),
+        )
     except Exception as e:
-        return _frontend_redirect("render", False, str(e))
+        raise HTTPException(status_code=400, detail=f"Render OAuth failed: {str(e)}")
 
 
 @router.get("/railway/authorize")
 async def get_railway_auth_url(
-    user_id: str = Query("local-user"),
+    user_id: str = Query(..., description="User ID for state parameter"),
 ) -> OAuthUrlResponse:
+    """Get Railway OAuth authorization URL.
+
+    Users should visit this URL to authorize the application to access their Railway account.
+    """
     railway_oauth = get_railway_oauth()
     if not railway_oauth:
-        raise HTTPException(status_code=503, detail="Railway OAuth not configured")
-    return OAuthUrlResponse(
-        auth_url=railway_oauth.get_auth_url(state=user_id), platform="railway"
-    )
+        raise HTTPException(
+            status_code=503, detail="Railway OAuth not configured on server"
+        )
+
+    auth_url = railway_oauth.get_auth_url(state=user_id)
+    return OAuthUrlResponse(auth_url=auth_url, platform="railway")
 
 
 @router.get("/railway/callback")
 async def railway_callback(
-    code: str = Query(...),
-    state: str = Query(None),
-):
+    code: str = Query(..., description="Authorization code"),
+    state: str = Query(None, description="State parameter")
+) -> OAuthTokenResponse:
+    """Handle Railway OAuth callback.
+
+    Exchange the authorization code for an access token and store it in the database.
+    """
     railway_oauth = get_railway_oauth()
     if not railway_oauth:
-        return _frontend_redirect("railway", False, "OAuth not configured")
+        raise HTTPException(
+            status_code=503, detail="Railway OAuth not configured on server"
+        )
+
     try:
-        user_id = state if state else "local-user"
-        await railway_oauth.exchange_code_for_token(code=code, user_id=user_id)
-        return _frontend_redirect("railway", True)
+        # Use state as user_id if provided, otherwise use a default
+        user_id = state if state else "default_user"
+        token_data = await railway_oauth.exchange_code_for_token(
+            code=code, user_id=user_id
+        )
+        return OAuthTokenResponse(
+            platform="railway",
+            access_token=token_data["access_token"],
+            expires_at=token_data.get("expires_at"),
+        )
     except Exception as e:
-        return _frontend_redirect("railway", False, str(e))
+        raise HTTPException(status_code=400, detail=f"Railway OAuth failed: {str(e)}")
 
 
 @router.delete("/credentials/{platform}")
 async def delete_credentials(
     platform: str, user_id: str = Depends(get_user_id)
 ) -> dict[str, str]:
+    """Delete stored OAuth credentials for a platform.
+
+    Args:
+        platform: Either 'vercel', 'render', or 'railway'
+        user_id: The authenticated user's ID
+
+    Returns:
+        Success message
+    """
     if platform not in ["vercel", "render", "railway"]:
-        raise HTTPException(status_code=400, detail="Invalid platform")
+        raise HTTPException(
+            status_code=400, detail="Platform must be either 'vercel', 'render', or 'railway'"
+        )
+
+    from ..services.database import get_db_service
+
     db = get_db_service()
     await db.delete_user_credential(user_id, platform)
+
     return {"message": f"Deleted {platform} credentials successfully"}
 
 
 @router.get("/credentials/status")
 async def get_credentials_status(user_id: str = Depends(get_user_id)) -> dict[str, dict]:
+    """Get the status of OAuth credentials for all platforms.
+
+    Returns information about which platforms the user has connected.
+    """
+    from ..services.database import get_db_service
+
     db = get_db_service()
-    status: dict[str, dict] = {}
-    for platform, account_ok in (
-        ("vercel", bool(settings.vercel_api_token)),
-        ("render", bool(settings.render_api_token)),
-        ("railway", False),
-    ):
-        creds = await db.get_user_credential(user_id, platform)
-        status[platform] = {
-            "connected": creds is not None or account_ok,
-            "user_token": creds is not None,
-            "account_token": account_ok,
-            "expires_at": creds.get("token_expires_at") if creds else None,
-        }
+
+    status = {}
+
+    # Check Vercel credentials
+    vercel_creds = await db.get_user_credential(user_id, "vercel")
+    status["vercel"] = {
+        "connected": vercel_creds is not None,
+        "expires_at": vercel_creds.get("token_expires_at") if vercel_creds else None,
+    }
+
+    # Check Render credentials
+    render_creds = await db.get_user_credential(user_id, "render")
+    status["render"] = {
+        "connected": render_creds is not None,
+        "expires_at": render_creds.get("token_expires_at") if render_creds else None,
+    }
+
+    # Check Railway credentials
+    railway_creds = await db.get_user_credential(user_id, "railway")
+    status["railway"] = {
+        "connected": railway_creds is not None,
+        "expires_at": railway_creds.get("token_expires_at") if railway_creds else None,
+    }
+
     return status

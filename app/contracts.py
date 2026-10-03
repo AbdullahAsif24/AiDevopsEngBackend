@@ -206,3 +206,189 @@ class JobStatus(BaseModel):
     detection: Optional[JobDetection] = None
     # Deployment result (populated after successful deployment).
     deployment: Optional[DeploymentResult] = None
+
+
+# ---------------------------------------------------------------------------
+# Auto-deploy on Push Contracts
+# ---------------------------------------------------------------------------
+class AutoDeployConfig(BaseModel):
+    id: str
+    user_id: str
+    repo_url: str
+    branch: str = "main"
+    is_active: bool = True
+    webhook_secret: str
+    webhook_url: str
+    auto_rollback: bool = True
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+class CreateAutoDeployRequest(BaseModel):
+    repo_url: str
+    branch: str = "main"
+    auto_rollback: bool = True
+
+
+class UpdateAutoDeployRequest(BaseModel):
+    branch: Optional[str] = None
+    is_active: Optional[bool] = None
+    auto_rollback: Optional[bool] = None
+
+
+class WebhookEventRecord(BaseModel):
+    id: str
+    config_id: Optional[str] = None
+    user_id: str
+    repo_url: str
+    branch: str
+    commit_sha: str
+    commit_message: str
+    committer: str
+    status: Literal["triggered", "skipped", "failed"]
+    job_id: Optional[str] = None
+    error_message: Optional[str] = None
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+class TestPushRequest(BaseModel):
+    config_id: Optional[str] = None
+    repo_url: Optional[str] = None
+    branch: Optional[str] = "main"
+    commit_message: Optional[str] = "Auto-deploy triggered by commit"
+    committer: Optional[str] = "devops-engineer"
+
+
+# ---------------------------------------------------------------------------
+# Secrets Management Contracts
+# ---------------------------------------------------------------------------
+SecretEnvironment = Literal["production", "staging", "development"]
+SecretRole = Literal["Admin", "Developer", "Viewer"]
+
+
+class SecretItem(BaseModel):
+    id: str
+    user_id: str
+    key: str
+    environment: SecretEnvironment
+    masked_value: str
+    version: int = 1
+    rotation_interval_days: Optional[int] = 30
+    last_rotated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    expires_at: Optional[datetime] = None
+    status: Literal["active", "expiring_soon", "expired", "rotated"] = "active"
+    shared_roles: list[SecretRole] = Field(default_factory=lambda: ["Admin", "Developer"])
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+class CreateSecretRequest(BaseModel):
+    key: str
+    value: str
+    environment: SecretEnvironment = "production"
+    rotation_interval_days: Optional[int] = 30
+    shared_roles: list[SecretRole] = Field(default_factory=lambda: ["Admin", "Developer"])
+
+
+class UpdateSecretRequest(BaseModel):
+    key: Optional[str] = None
+    environment: Optional[SecretEnvironment] = None
+    rotation_interval_days: Optional[int] = None
+    shared_roles: Optional[list[SecretRole]] = None
+
+
+class RotateSecretRequest(BaseModel):
+    new_value: Optional[str] = None
+    auto_generate: bool = False
+
+
+class RevealSecretResponse(BaseModel):
+    id: str
+    key: str
+    environment: SecretEnvironment
+    plain_value: str
+    revealed_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+class SecretAuditLog(BaseModel):
+    id: str
+    user_id: str
+    secret_id: Optional[str] = None
+    secret_key: str
+    environment: str
+    action: Literal["create", "reveal", "rotate", "update", "delete", "share"]
+    actor: str
+    ip_address: str = "127.0.0.1"
+    details: str
+    timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+class TeamMember(BaseModel):
+    id: str
+    user_id: str
+    email: str
+    name: str
+    role: SecretRole
+    status: Literal["active", "pending"] = "active"
+    joined_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+class InviteTeamMemberRequest(BaseModel):
+    email: str
+    name: str
+    role: SecretRole = "Developer"
+
+
+# ---------------------------------------------------------------------------
+# Custom Domain Management Contracts
+# ---------------------------------------------------------------------------
+DomainStatus = Literal["active", "pending_dns", "verifying", "ssl_issuing", "failed"]
+SSLStatus = Literal["issued", "pending", "renewing", "failed"]
+HealthStatus = Literal["healthy", "degraded", "down", "pending"]
+
+
+class DNSRecord(BaseModel):
+    type: Literal["CNAME", "A"] = "CNAME"
+    host: str
+    value: str
+    ttl: int = 60
+    verified: bool = False
+
+
+class CustomDomainItem(BaseModel):
+    id: str
+    user_id: str
+    domain: str
+    job_id: Optional[str] = None
+    target_url: str = ""
+    status: DomainStatus = "pending_dns"
+    dns_record: DNSRecord
+    dns_verified: bool = False
+    ssl_status: SSLStatus = "pending"
+    ssl_issuer: str = "Let's Encrypt Authority X3"
+    ssl_expires_at: Optional[datetime] = None
+    auto_ssl_renew: bool = True
+    health_status: HealthStatus = "pending"
+    latency_ms: Optional[int] = None
+    uptime_percent: float = 100.0
+    http_status_code: Optional[int] = None
+    last_checked_at: Optional[datetime] = None
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+class CreateDomainRequest(BaseModel):
+    domain: str
+    job_id: Optional[str] = None
+    target_url: Optional[str] = None
+
+
+class DomainHealthCheckResponse(BaseModel):
+    domain_id: str
+    domain: str
+    health_status: HealthStatus
+    latency_ms: int
+    http_status_code: int
+    ssl_status: SSLStatus
+    ssl_expires_days: int
+    checked_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+

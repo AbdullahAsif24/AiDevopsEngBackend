@@ -168,3 +168,116 @@ FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 GRANT ALL ON ALL TABLES IN SCHEMA public TO service_role;
 GRANT ALL ON ALL SEQUENCES IN SCHEMA public TO service_role;
 GRANT ALL ON ALL FUNCTIONS IN SCHEMA public TO service_role;
+
+-- =========================================================================
+-- Auto-deploy on Push Tables
+-- =========================================================================
+CREATE TABLE IF NOT EXISTS auto_deploy_configs (
+  id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
+  user_id UUID REFERENCES auth.users NOT NULL,
+  repo_url TEXT NOT NULL,
+  branch TEXT NOT NULL DEFAULT 'main',
+  is_active BOOLEAN NOT NULL DEFAULT true,
+  webhook_secret TEXT NOT NULL,
+  webhook_url TEXT NOT NULL,
+  auto_rollback BOOLEAN NOT NULL DEFAULT true,
+  created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+  updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS webhook_events (
+  id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
+  config_id UUID REFERENCES auto_deploy_configs(id) ON DELETE SET NULL,
+  user_id UUID REFERENCES auth.users NOT NULL,
+  repo_url TEXT NOT NULL,
+  branch TEXT NOT NULL,
+  commit_sha TEXT NOT NULL,
+  commit_message TEXT NOT NULL,
+  committer TEXT NOT NULL,
+  status TEXT NOT NULL CHECK (status IN ('triggered', 'skipped', 'failed')),
+  job_id TEXT,
+  error_message TEXT,
+  created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_auto_deploy_user_id ON auto_deploy_configs(user_id);
+CREATE INDEX IF NOT EXISTS idx_webhook_events_user_id ON webhook_events(user_id);
+CREATE INDEX IF NOT EXISTS idx_webhook_events_created_at ON webhook_events(created_at DESC);
+
+-- =========================================================================
+-- Secrets Vault Tables (Military-Grade Encrypted Storage)
+-- =========================================================================
+CREATE TABLE IF NOT EXISTS secrets (
+  id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
+  user_id UUID REFERENCES auth.users NOT NULL,
+  key TEXT NOT NULL,
+  environment TEXT NOT NULL CHECK (environment IN ('production', 'staging', 'development')),
+  encrypted_value TEXT NOT NULL,
+  masked_value TEXT NOT NULL,
+  version INT NOT NULL DEFAULT 1,
+  rotation_interval_days INT DEFAULT 30,
+  last_rotated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+  expires_at TIMESTAMP WITH TIME ZONE,
+  shared_roles JSONB DEFAULT '["Admin", "Developer"]'::jsonb,
+  created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+  updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+  UNIQUE(user_id, key, environment)
+);
+
+CREATE TABLE IF NOT EXISTS secret_audit_logs (
+  id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
+  user_id UUID REFERENCES auth.users NOT NULL,
+  secret_id UUID,
+  secret_key TEXT NOT NULL,
+  environment TEXT NOT NULL,
+  action TEXT NOT NULL CHECK (action IN ('create', 'reveal', 'rotate', 'update', 'delete', 'share')),
+  actor TEXT NOT NULL,
+  ip_address TEXT DEFAULT '127.0.0.1',
+  details TEXT NOT NULL,
+  timestamp TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_secrets_user_id ON secrets(user_id);
+CREATE INDEX IF NOT EXISTS idx_secrets_env ON secrets(environment);
+CREATE INDEX IF NOT EXISTS idx_secret_audit_user_id ON secret_audit_logs(user_id);
+CREATE INDEX IF NOT EXISTS idx_secret_audit_timestamp ON secret_audit_logs(timestamp DESC);
+
+-- =========================================================================
+-- Custom Domains & Health Check Tables
+-- =========================================================================
+CREATE TABLE IF NOT EXISTS custom_domains (
+  id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
+  user_id UUID REFERENCES auth.users NOT NULL,
+  domain TEXT NOT NULL,
+  job_id TEXT,
+  target_url TEXT,
+  status TEXT NOT NULL DEFAULT 'pending_dns',
+  dns_type TEXT NOT NULL DEFAULT 'CNAME',
+  dns_host TEXT NOT NULL DEFAULT '@',
+  dns_target TEXT NOT NULL DEFAULT 'cname.aidevops.app',
+  dns_ttl INT DEFAULT 60,
+  dns_verified BOOLEAN DEFAULT false,
+  ssl_status TEXT NOT NULL DEFAULT 'pending',
+  ssl_issuer TEXT DEFAULT 'Let''s Encrypt Authority X3',
+  ssl_expires_at TIMESTAMP WITH TIME ZONE,
+  auto_ssl_renew BOOLEAN DEFAULT true,
+  health_status TEXT NOT NULL DEFAULT 'pending',
+  latency_ms INT,
+  uptime_percent REAL DEFAULT 100.0,
+  http_status_code INT,
+  last_checked_at TIMESTAMP WITH TIME ZONE,
+  created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+  UNIQUE(user_id, domain)
+);
+
+CREATE INDEX IF NOT EXISTS idx_domains_user_id ON custom_domains(user_id);
+CREATE INDEX IF NOT EXISTS idx_domains_domain ON custom_domains(domain);
+
+-- Automatically update timestamps for new tables
+CREATE TRIGGER update_auto_deploy_configs_updated_at 
+BEFORE UPDATE ON auto_deploy_configs 
+FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+CREATE TRIGGER update_secrets_updated_at 
+BEFORE UPDATE ON secrets 
+FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();

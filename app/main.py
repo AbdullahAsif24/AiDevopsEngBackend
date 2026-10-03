@@ -17,6 +17,10 @@ from .routes import ws as ws_router
 from .routes import oauth as oauth_router
 from .routes import env_vars as env_vars_router
 from .routes import auth as auth_router
+from .routes import auto_deploy as auto_deploy_router
+from .routes import webhooks as webhooks_router
+from .routes import secrets as secrets_router
+from .routes import domains as domains_router
 
 app = FastAPI(
     title="AI DevOps Engineer Backend",
@@ -41,6 +45,11 @@ app.include_router(ws_router.router)
 app.include_router(oauth_router.router)
 app.include_router(env_vars_router.router)
 app.include_router(auth_router.router)
+app.include_router(auto_deploy_router.router)
+app.include_router(webhooks_router.router)
+app.include_router(secrets_router.router)
+app.include_router(domains_router.router)
+
 
 
 @app.get("/health")
