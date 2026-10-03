@@ -219,44 +219,45 @@ async def _create_or_get_service(
 ) -> dict[str, Any]:
     env_payload = [{"key": key, "value": str(value)} for key, value in env_vars.items()]
 
-    # Build serviceDetails based on runtime
-    service_details: dict[str, Any] = {
-        "plan": "starter",
-        "region": "oregon",
-    }
+    plan = (settings.render_plan or "free").strip().lower() or "free"
+    region = (settings.render_region or "oregon").strip().lower() or "oregon"
 
-    if runtime == "node":
-        service_details["runtime"] = "node"
-        if build_command:
-            service_details["buildCommand"] = build_command
-        if start_command:
-            service_details["startCommand"] = start_command
-    elif runtime == "python":
-        service_details["runtime"] = "python"
-        if build_command:
-            service_details["buildCommand"] = build_command
-        if start_command:
-            service_details["startCommand"] = start_command
-    elif runtime == "static_site":
-        # Static sites use a different endpoint type
-        service_details["runtime"] = "static_site"
-        if build_command:
-            service_details["buildCommand"] = build_command
-        service_details["staticPublishPath"] = "./dist"
+    # Render rejects top-level buildCommand/startCommand on serviceDetails for
+    # native runtimes — they MUST live under envSpecificDetails.
+    if runtime == "static_site":
+        body: dict[str, Any] = {
+            "type": "static_site",
+            "name": name,
+            "ownerId": owner_id,
+            "repo": repo_url,
+            "autoDeploy": "yes",
+            "serviceDetails": {
+                "buildCommand": build_command or "npm run build",
+                "publishPath": "dist",
+            },
+        }
     else:
-        # Fallback: try native node
-        service_details["runtime"] = "node"
-        if start_command:
-            service_details["startCommand"] = start_command
+        # node / python / fallback
+        native_runtime = runtime if runtime in ("node", "python") else "node"
+        body = {
+            "type": "web_service",
+            "name": name,
+            "ownerId": owner_id,
+            "repo": repo_url,
+            "autoDeploy": "yes",
+            "serviceDetails": {
+                "runtime": native_runtime,
+                "plan": plan,
+                "region": region,
+                "envSpecificDetails": {
+                    "buildCommand": build_command
+                    or ("npm install" if native_runtime == "node" else "pip install -r requirements.txt"),
+                    "startCommand": start_command
+                    or ("node index.js" if native_runtime == "node" else "gunicorn app:app"),
+                },
+            },
+        }
 
-    body: dict[str, Any] = {
-        "type": "web_service",
-        "name": name,
-        "ownerId": owner_id,
-        "repo": repo_url,
-        "autoDeploy": "yes",
-        "serviceDetails": service_details,
-    }
     if env_payload:
         body["envVars"] = env_payload
 

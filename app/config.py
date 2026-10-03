@@ -54,8 +54,12 @@ class Settings:
 
     # Account-level API tokens (fallback for deployments)
     vercel_api_token: str = os.getenv("VERCEL_API_TOKEN", "")
-    render_api_token: str = os.getenv("RENDER_API_TOKEN", "")
+    render_api_token: str = (
+        os.getenv("RENDER_API_TOKEN", "") or os.getenv("RENDER_API_KEY", "")
+    )
     render_owner_id: str = os.getenv("RENDER_OWNER_ID", "")
+    render_plan: str = os.getenv("RENDER_PLAN", "free")
+    render_region: str = os.getenv("RENDER_REGION", "oregon")
     vercel_team_id: str = os.getenv("VERCEL_TEAM_ID", "")
 
     # GitHub token for committing Dockerfiles to repos (fallback if OAuth fails)
